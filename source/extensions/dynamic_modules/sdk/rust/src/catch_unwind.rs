@@ -151,7 +151,7 @@ use crate::buffer::EnvoyBuffer;
 // ---------------------------------------------------------------------------
 // HttpFilter
 // ---------------------------------------------------------------------------
-use crate::http::{EnvoyHttpFilter, HttpFilter};
+use crate::http::{EnvoyHttpFilter, GrpcCalloutResponse, HttpFilter};
 
 /// Fail-closed 500 response sent when an HTTP filter panics on the request path.
 fn send_500<EHF: EnvoyHttpFilter>(envoy: &mut EHF) {
@@ -289,6 +289,22 @@ impl<EHF: EnvoyHttpFilter, F: HttpFilter<EHF>> HttpFilter<EHF> for CatchUnwind<F
           response_headers,
           response_body,
         )
+      }),
+      Err(CatchError::Panicked)
+    ) {
+      reset_stream(envoy_filter);
+    }
+  }
+
+  fn on_grpc_callout_done(
+    &self,
+    envoy_filter: &mut EHF,
+    callout_id: u64,
+    response: GrpcCalloutResponse<'_>,
+  ) {
+    if matches!(
+      self.catch_or_skip_ref("on_grpc_callout_done", |f| {
+        f.on_grpc_callout_done(envoy_filter, callout_id, response)
       }),
       Err(CatchError::Panicked)
     ) {

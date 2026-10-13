@@ -1,6 +1,10 @@
 #include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <string>
 
 #include "envoy/extensions/filters/http/dynamic_modules/v3/dynamic_modules.pb.h"
+#include "envoy/grpc/status.h"
 #include "envoy/registry/registry.h"
 #include "envoy/server/tracer_config.h"
 #include "envoy/tracing/trace_driver.h"
@@ -12,6 +16,7 @@
 #include "test/extensions/dynamic_modules/util.h"
 #include "test/integration/http_integration.h"
 #include "test/test_common/logging.h"
+#include "test/test_common/simulated_time_system.h"
 
 namespace Envoy {
 
@@ -959,6 +964,221 @@ TEST_P(DynamicModulesIntegrationTest, HttpCalloutsOK) {
   EXPECT_TRUE(response->complete());
   EXPECT_EQ("200", response->headers().Status()->value().getStringView());
   EXPECT_EQ("local_response_body", response->body());
+}
+
+class DynamicModulesGrpcIntegrationTest : public Event::TestUsingSimulatedTime,
+                                          public DynamicModulesIntegrationTest {
+public:
+  static constexpr std::chrono::milliseconds CalloutTimeout{5000};
+  static constexpr uint32_t MaxMessageLength = 1024;
+
+  void initializeGrpcCallout(uint32_t max_message_length = MaxMessageLength) {
+    initializeFilter("grpc_callout",
+                     fmt::format("cluster_0,{},{}", CalloutTimeout.count(), max_message_length));
+    codec_client_ = makeHttpConnection(makeClientConnection(lookupPort("http")));
+  }
+
+  IntegrationStreamDecoderPtr startGrpcCallout(uint32_t max_message_length = MaxMessageLength) {
+    initializeGrpcCallout(max_message_length);
+    auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+    waitForNextUpstreamRequest();
+    return response;
+  }
+
+  void expectHeader(const Http::HeaderMap& headers, absl::string_view name,
+                    absl::string_view expected) {
+    const auto values = headers.get(Http::LowerCaseString(name));
+    ASSERT_EQ(1U, values.size());
+    EXPECT_EQ(expected, values[0]->value().getStringView());
+  }
+
+  void expectGrpcStatus(IntegrationStreamDecoder& response, Grpc::Status::GrpcStatus expected) {
+    EXPECT_EQ("200", response.headers().getStatusValue());
+    expectHeader(response.headers(), "x-grpc-status", std::to_string(expected));
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    Rust, DynamicModulesGrpcIntegrationTest, testing::Values("rust", "rust_static"),
+    Extensions::DynamicModules::DynamicModuleTestLanguages::languageParamToTestName);
+
+TEST_P(DynamicModulesGrpcIntegrationTest, GrpcCalloutSuccess) {
+  auto response = startGrpcCallout();
+  EXPECT_EQ("POST", upstream_request_->headers().getMethodValue());
+  EXPECT_EQ("/test.Callout/Fetch", upstream_request_->headers().getPathValue());
+  expectHeader(upstream_request_->headers(), "content-type", "application/grpc");
+  expectHeader(upstream_request_->headers(), "x-request", "request-value");
+  expectHeader(upstream_request_->headers(), "request-bin", "AA0K/w==");
+
+  ProtobufWkt::StringValue request;
+  ASSERT_TRUE(upstream_request_->waitForGrpcMessage(*dispatcher_, request));
+  EXPECT_EQ("request", request.value());
+
+  upstream_request_->startGrpcStream(false);
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"},
+                                                                   {"x-initial", "initial-value"},
+                                                                   {"initial-bin", "AP8="}},
+                                   false);
+  ProtobufWkt::StringValue reply;
+  reply.set_value("response");
+  upstream_request_->sendGrpcMessage(reply);
+  upstream_request_->encodeTrailers(Http::TestResponseTrailerMapImpl{
+      {"grpc-status", "0"}, {"x-trailing", "trailing-value"}, {"trailing-bin", "AP8="}});
+
+  ASSERT_TRUE(response->waitForEndStream());
+  expectGrpcStatus(*response, Grpc::Status::Ok);
+  expectHeader(response->headers(), "x-grpc-response-present", "true");
+  expectHeader(response->headers(), "x-grpc-initial", "initial-value");
+  expectHeader(response->headers(), "x-grpc-initial-bin", "AP8=");
+  expectHeader(response->headers(), "x-grpc-trailing", "trailing-value");
+  expectHeader(response->headers(), "x-grpc-trailing-bin", "AP8=");
+  ProtobufWkt::StringValue received;
+  ASSERT_TRUE(received.ParseFromString(response->body()));
+  EXPECT_EQ(reply.value(), received.value());
+}
+
+TEST_P(DynamicModulesGrpcIntegrationTest, GrpcCalloutEmptyResponse) {
+  auto response = startGrpcCallout();
+  upstream_request_->startGrpcStream();
+  upstream_request_->sendGrpcMessage(ProtobufWkt::StringValue{});
+  upstream_request_->finishGrpcStream(Grpc::Status::Ok);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  expectGrpcStatus(*response, Grpc::Status::Ok);
+  expectHeader(response->headers(), "x-grpc-response-present", "true");
+  EXPECT_TRUE(response->body().empty());
+}
+
+TEST_P(DynamicModulesGrpcIntegrationTest, GrpcCalloutTrailersOnlyError) {
+  auto response = startGrpcCallout();
+  upstream_request_->encodeHeaders(
+      Http::TestResponseHeaderMapImpl{
+          {":status", "200"},
+          {"grpc-status", std::to_string(Grpc::Status::PermissionDenied)},
+          {"grpc-message", "permission-denied"},
+          {"x-trailing", "error-metadata"}},
+      true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  expectGrpcStatus(*response, Grpc::Status::PermissionDenied);
+  expectHeader(response->headers(), "x-grpc-response-present", "false");
+  const auto status_message =
+      response->headers().get(Http::LowerCaseString("x-grpc-status-message"));
+  ASSERT_EQ(1U, status_message.size());
+  EXPECT_THAT(status_message[0]->value().getStringView(), testing::StartsWith("permission-denied"));
+  expectHeader(response->headers(), "x-grpc-trailing", "error-metadata");
+}
+
+TEST_P(DynamicModulesGrpcIntegrationTest, GrpcCalloutNonOkStatusWithHeaders) {
+  auto response = startGrpcCallout();
+  upstream_request_->encodeHeaders(
+      Http::TestResponseHeaderMapImpl{{":status", "200"}, {"x-initial", "initial-value"}}, false);
+  upstream_request_->encodeTrailers(Http::TestResponseTrailerMapImpl{
+      {"grpc-status", std::to_string(Grpc::Status::PermissionDenied)},
+      {"x-trailing", "error-metadata"}});
+
+  ASSERT_TRUE(response->waitForEndStream());
+  expectGrpcStatus(*response, Grpc::Status::PermissionDenied);
+  expectHeader(response->headers(), "x-grpc-initial", "initial-value");
+  expectHeader(response->headers(), "x-grpc-trailing", "error-metadata");
+}
+
+TEST_P(DynamicModulesGrpcIntegrationTest, GrpcCalloutMissingResponse) {
+  auto response = startGrpcCallout();
+  upstream_request_->startGrpcStream();
+  upstream_request_->finishGrpcStream(Grpc::Status::Ok);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  expectGrpcStatus(*response, Grpc::Status::Internal);
+  expectHeader(response->headers(), "x-grpc-response-present", "false");
+}
+
+TEST_P(DynamicModulesGrpcIntegrationTest, GrpcCalloutExtraResponse) {
+  auto response = startGrpcCallout();
+  upstream_request_->startGrpcStream();
+  ProtobufWkt::StringValue reply;
+  reply.set_value("response");
+  upstream_request_->sendGrpcMessage(reply);
+  upstream_request_->sendGrpcMessage(reply);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  expectGrpcStatus(*response, Grpc::Status::Internal);
+  ASSERT_TRUE(upstream_request_->waitForReset(*dispatcher_));
+}
+
+TEST_P(DynamicModulesGrpcIntegrationTest, GrpcCalloutTruncatedSecondResponse) {
+  auto response = startGrpcCallout();
+  upstream_request_->startGrpcStream();
+  ProtobufWkt::StringValue reply;
+  reply.set_value("response");
+  upstream_request_->sendGrpcMessage(reply);
+  // A lone flags byte starts a second frame without its length or payload.
+  upstream_request_->encodeData(std::string(1, '\0'), false);
+  upstream_request_->finishGrpcStream(Grpc::Status::Ok);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  expectGrpcStatus(*response, Grpc::Status::Internal);
+}
+
+TEST_P(DynamicModulesGrpcIntegrationTest, GrpcCalloutResponseLimit) {
+  ProtobufWkt::StringValue request;
+  request.set_value("request");
+  auto response = startGrpcCallout(static_cast<uint32_t>(request.ByteSizeLong()));
+  upstream_request_->startGrpcStream();
+  ProtobufWkt::StringValue reply;
+  reply.set_value("response larger than the request-sized limit");
+  upstream_request_->sendGrpcMessage(reply);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  expectGrpcStatus(*response, Grpc::Status::ResourceExhausted);
+  ASSERT_TRUE(upstream_request_->waitForReset(*dispatcher_));
+}
+
+TEST_P(DynamicModulesGrpcIntegrationTest, GrpcCalloutUpstreamReset) {
+  auto response = startGrpcCallout();
+  upstream_request_->encodeResetStream();
+
+  ASSERT_TRUE(response->waitForEndStream());
+  expectGrpcStatus(*response, Grpc::Status::Unavailable);
+}
+
+TEST_P(DynamicModulesGrpcIntegrationTest, GrpcCalloutTimeoutBeforeHeaders) {
+  auto response = startGrpcCallout();
+  simTime().advanceTimeWait(CalloutTimeout);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  expectGrpcStatus(*response, Grpc::Status::DeadlineExceeded);
+  ASSERT_TRUE(upstream_request_->waitForReset(*dispatcher_));
+}
+
+TEST_P(DynamicModulesGrpcIntegrationTest, GrpcCalloutTimeoutAfterHeaders) {
+  auto response = startGrpcCallout();
+  upstream_request_->encodeHeaders(
+      Http::TestResponseHeaderMapImpl{{":status", "200"}, {"x-initial", "initial-value"}}, false);
+  test_server_->waitForCounter("cluster.cluster_0.upstream_rq_200", testing::Eq(1));
+  simTime().advanceTimeWait(CalloutTimeout);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  expectGrpcStatus(*response, Grpc::Status::DeadlineExceeded);
+  expectHeader(response->headers(), "x-grpc-initial", "initial-value");
+  ASSERT_TRUE(upstream_request_->waitForReset(*dispatcher_));
+}
+
+TEST_P(DynamicModulesGrpcIntegrationTest, GrpcCalloutCancelledWithParent) {
+  initializeGrpcCallout();
+  auto [encoder, cancelled_response] = codec_client_->startRequest(default_request_headers_, true);
+  waitForNextUpstreamRequest();
+  codec_client_->sendReset(encoder);
+  ASSERT_TRUE(cancelled_response->waitForReset());
+  ASSERT_TRUE(upstream_request_->waitForReset(*dispatcher_));
+
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  waitForNextUpstreamRequest();
+  upstream_request_->startGrpcStream();
+  upstream_request_->sendGrpcMessage(ProtobufWkt::StringValue{});
+  upstream_request_->finishGrpcStream(Grpc::Status::Ok);
+  ASSERT_TRUE(response->waitForEndStream());
+  expectGrpcStatus(*response, Grpc::Status::Ok);
 }
 
 TEST_P(DynamicModulesIntegrationTest, Scheduler) {

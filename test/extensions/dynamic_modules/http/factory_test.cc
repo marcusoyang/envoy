@@ -1,6 +1,9 @@
+#include <memory>
+
 #include "envoy/extensions/filters/http/dynamic_modules/v3/dynamic_modules.pb.h"
 
 #include "source/extensions/filters/http/dynamic_modules/factory.h"
+#include "source/extensions/filters/http/dynamic_modules/filter.h"
 
 #include "test/extensions/dynamic_modules/util.h"
 #include "test/mocks/server/factory_context.h"
@@ -246,7 +249,11 @@ filter_config:
   NiceMock<Event::MockDispatcher> dispatcher{"worker_0"};
   ON_CALL(callbacks, dispatcher()).WillByDefault(ReturnRef(dispatcher));
 
-  EXPECT_CALL(callbacks, addStreamFilter(testing::_));
+  EXPECT_CALL(callbacks, addStreamFilter(testing::_))
+      .WillOnce([](Http::StreamFilterSharedPtr filter) {
+        auto module_filter = std::static_pointer_cast<DynamicModuleHttpFilter>(filter);
+        EXPECT_EQ(nullptr, module_filter->getFilterConfig().on_http_filter_grpc_callout_done_);
+      });
   factory_cb(callbacks);
 }
 

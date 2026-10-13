@@ -1,4 +1,5 @@
 #include <cstring>
+#include <functional>
 
 #include "envoy/extensions/transport_sockets/tls/v3/secret.pb.h"
 #include "envoy/registry/registry.h"
@@ -10,6 +11,7 @@
 
 #include "test/extensions/dynamic_modules/util.h"
 #include "test/mocks/event/mocks.h"
+#include "test/mocks/grpc/mocks.h"
 #include "test/mocks/http/mocks.h"
 #include "test/mocks/server/server_factory_context.h"
 #include "test/mocks/tracing/mocks.h"
@@ -3345,6 +3347,407 @@ TEST(DynamicModulesTest, PerDirectionContinueEncodeDoesNotBlockDecode) {
   filter->continueDecoding();
 
   filter->onDestroy();
+}
+
+class DynamicModuleGrpcCalloutTest : public testing::Test {
+public:
+  void SetUp() override {
+    config_ = std::make_shared<DynamicModuleHttpFilterConfig>(
+        "grpc", "", DefaultMetricsNamespace, nullptr, *stats_store_.createScope(""), context_);
+    config_->in_module_config_ = this;
+    config_->on_http_filter_new_ = [](auto config, auto) { return config; };
+    config_->on_http_filter_destroy_ = [](auto) {};
+    config_->on_http_filter_grpc_callout_done_ =
+        [](auto, auto module, uint64_t id, int64_t status,
+           envoy_dynamic_module_type_envoy_buffer message,
+           envoy_dynamic_module_type_envoy_http_header* initial, size_t initial_count,
+           envoy_dynamic_module_type_envoy_buffer* chunks, size_t chunk_count, bool has_message,
+           envoy_dynamic_module_type_envoy_http_header* trailing, size_t trailing_count) {
+          auto& test = *const_cast<DynamicModuleGrpcCalloutTest*>(
+              static_cast<const DynamicModuleGrpcCalloutTest*>(module));
+          ++test.completions_;
+          test.completed_id_ = id;
+          test.status_ = status;
+          test.message_.assign(message.ptr, message.length);
+          test.has_message_ = has_message;
+          test.response_.clear();
+          for (size_t index = 0; index < chunk_count; ++index) {
+            test.response_.append(chunks[index].ptr, chunks[index].length);
+          }
+          for (size_t index = 0; index < initial_count; ++index) {
+            test.initial_.emplace_back(
+                std::string(initial[index].key_ptr, initial[index].key_length),
+                std::string(initial[index].value_ptr, initial[index].value_length));
+          }
+          for (size_t index = 0; index < trailing_count; ++index) {
+            test.trailing_.emplace_back(
+                std::string(trailing[index].key_ptr, trailing[index].key_length),
+                std::string(trailing[index].value_ptr, trailing[index].value_length));
+          }
+          if (test.on_completion_) {
+            test.on_completion_();
+          }
+        };
+    filter_ = std::make_shared<DynamicModuleHttpFilter>(config_, stats_store_.symbolTable(), 0);
+    filter_->setDecoderFilterCallbacks(decoder_callbacks_);
+    filter_->initializeInModuleFilter();
+    ON_CALL(context_.cluster_manager_, getThreadLocalCluster("grpc_cluster"))
+        .WillByDefault(testing::Return(&cluster_));
+    ON_CALL(stream_, streamInfo()).WillByDefault(testing::ReturnRef(stream_info_));
+  }
+
+  void TearDown() override {
+    if (filter_) {
+      filter_->onDestroy();
+      filter_.reset();
+    }
+    decoder_callbacks_.dispatcher_.to_delete_.clear();
+  }
+
+  void expectClient() {
+    EXPECT_CALL(context_.cluster_manager_.async_client_manager_,
+                getOrCreateRawAsyncClient(_, _, true))
+        .WillOnce(testing::Invoke([this](const auto& service, auto&, bool) {
+          EXPECT_EQ(service.envoy_grpc().cluster_name(), "grpc_cluster");
+          EXPECT_EQ(service.envoy_grpc().max_receive_message_length().value(), MessageLimit);
+          return absl::StatusOr<Grpc::RawAsyncClientSharedPtr>(client_);
+        }));
+  }
+
+  void expectStart() {
+    expectClient();
+    EXPECT_CALL(*client_, startRaw("example.Lookup", "Get", _, _))
+        .WillOnce(testing::Invoke([this](auto, auto, Grpc::RawAsyncStreamCallbacks& callbacks,
+                                         const Http::AsyncClient::StreamOptions& options) {
+          EXPECT_EQ(options.timeout, std::chrono::milliseconds(TimeoutMilliseconds));
+          callbacks_ = &callbacks;
+          Http::TestRequestHeaderMapImpl metadata;
+          callbacks.onCreateInitialMetadata(metadata);
+          EXPECT_EQ(metadata.get(Http::LowerCaseString("lookup"))[0]->value().getStringView(),
+                    "one");
+          return &stream_;
+        }));
+    EXPECT_CALL(stream_, sendMessageRaw_(_, true))
+        .WillOnce(testing::Invoke(
+            [](Buffer::InstancePtr& request, bool) { EXPECT_EQ(request->toString(), "request"); }));
+  }
+
+  envoy_dynamic_module_type_grpc_callout_init_result
+  start(uint64_t& id, absl::string_view cluster = "grpc_cluster") {
+    auto metadata = Http::RequestHeaderMapImpl::create();
+    metadata->addCopy(Http::LowerCaseString("lookup"), "one");
+    return filter_->sendGrpcCallout(&id, cluster, "example.Lookup", "Get", std::move(metadata), {},
+                                    std::make_unique<Buffer::OwnedImpl>("request"),
+                                    TimeoutMilliseconds, MessageLimit);
+  }
+
+  void receiveTrailers() {
+    EXPECT_CALL(stream_, streamInfo()).WillOnce(testing::ReturnRef(stream_info_));
+    callbacks_->onReceiveTrailingMetadata(std::make_unique<Http::TestResponseTrailerMapImpl>(
+        std::initializer_list<std::pair<std::string, std::string>>{{"lookup-trailer", "value"}}));
+  }
+
+  static constexpr uint64_t TimeoutMilliseconds = 250;
+  static constexpr uint32_t MessageLimit = 1024;
+  NiceMock<Server::Configuration::MockServerFactoryContext> context_;
+  Stats::IsolatedStoreImpl stats_store_;
+  NiceMock<Upstream::MockThreadLocalCluster> cluster_;
+  NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks_;
+  NiceMock<StreamInfo::MockStreamInfo> stream_info_;
+  testing::StrictMock<Grpc::MockAsyncStream> stream_;
+  std::shared_ptr<testing::StrictMock<Grpc::MockAsyncClient>> client_ =
+      std::make_shared<testing::StrictMock<Grpc::MockAsyncClient>>();
+  DynamicModuleHttpFilterConfigSharedPtr config_;
+  DynamicModuleHttpFilterSharedPtr filter_;
+  Grpc::RawAsyncStreamCallbacks* callbacks_ = nullptr;
+  size_t completions_ = 0;
+  uint64_t completed_id_ = 0;
+  int64_t status_ = Grpc::Status::WellKnownGrpcStatus::Unknown;
+  std::string message_;
+  bool has_message_ = false;
+  std::string response_;
+  std::vector<std::pair<std::string, std::string>> initial_;
+  std::vector<std::pair<std::string, std::string>> trailing_;
+  std::function<void()> on_completion_;
+};
+
+TEST_F(DynamicModuleGrpcCalloutTest, RequiresAttachedConstructedFilterAndHook) {
+  uint64_t id = 99;
+  auto done_hook = config_->on_http_filter_grpc_callout_done_;
+  config_->on_http_filter_grpc_callout_done_ = nullptr;
+  EXPECT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument);
+  EXPECT_EQ(id, 0);
+  config_->on_http_filter_grpc_callout_done_ = done_hook;
+  auto unattached =
+      std::make_shared<DynamicModuleHttpFilter>(config_, stats_store_.symbolTable(), 0);
+  unattached->initializeInModuleFilter();
+  EXPECT_EQ(unattached->sendGrpcCallout(
+                &id, "grpc_cluster", "example.Lookup", "Get", Http::RequestHeaderMapImpl::create(),
+                {}, std::make_unique<Buffer::OwnedImpl>(), TimeoutMilliseconds, MessageLimit),
+            envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument);
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, ConstructorCannotStartCallout) {
+  uint64_t id = 99;
+  auto unconstructed =
+      std::make_shared<DynamicModuleHttpFilter>(config_, stats_store_.symbolTable(), 0);
+  unconstructed->setDecoderFilterCallbacks(decoder_callbacks_);
+  EXPECT_EQ(unconstructed->sendGrpcCallout(
+                &id, "grpc_cluster", "example.Lookup", "Get", Http::RequestHeaderMapImpl::create(),
+                {}, std::make_unique<Buffer::OwnedImpl>(), TimeoutMilliseconds, MessageLimit),
+            envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument);
+  EXPECT_EQ(id, 0);
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, MissingCluster) {
+  uint64_t id = 99;
+  EXPECT_CALL(context_.cluster_manager_, getThreadLocalCluster("missing"))
+      .WillOnce(testing::Return(nullptr));
+  EXPECT_EQ(start(id, "missing"),
+            envoy_dynamic_module_type_grpc_callout_init_result_ClusterNotFound);
+  EXPECT_EQ(id, 0);
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, CannotCreateClient) {
+  uint64_t id = 99;
+  EXPECT_CALL(context_.cluster_manager_.async_client_manager_,
+              getOrCreateRawAsyncClient(_, _, true))
+      .WillOnce(testing::Return(absl::InternalError("unavailable")));
+  EXPECT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_CannotCreateRequest);
+  EXPECT_EQ(id, 0);
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, InlineStartFailureDoesNotCompleteModule) {
+  expectClient();
+  EXPECT_CALL(*client_, startRaw(_, _, _, _))
+      .WillOnce(
+          testing::Invoke([](auto, auto, Grpc::RawAsyncStreamCallbacks& callbacks, const auto&) {
+            callbacks.onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Unavailable, "unavailable");
+            return nullptr;
+          }));
+  uint64_t id = 99;
+  EXPECT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_CannotCreateRequest);
+  EXPECT_EQ(id, 0);
+  EXPECT_EQ(completions_, 0);
+  EXPECT_EQ(decoder_callbacks_.dispatcher_.to_delete_.size(), 1);
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, InlineSendFailureDoesNotCompleteModule) {
+  expectClient();
+  EXPECT_CALL(*client_, startRaw(_, _, _, _))
+      .WillOnce(testing::Invoke(
+          [this](auto, auto, Grpc::RawAsyncStreamCallbacks& callbacks, const auto&) {
+            callbacks_ = &callbacks;
+            return &stream_;
+          }));
+  EXPECT_CALL(stream_, sendMessageRaw_(_, true)).WillOnce(testing::Invoke([this](auto&, bool) {
+    callbacks_->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Internal, "reset");
+  }));
+  uint64_t id = 99;
+  EXPECT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_CannotCreateRequest);
+  EXPECT_EQ(id, 0);
+  EXPECT_EQ(completions_, 0);
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, MessageAndMetadataStayAliveDuringCompletion) {
+  expectStart();
+  uint64_t id = 0;
+  ASSERT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  EXPECT_NE(id, 0);
+  EXPECT_EQ(completions_, 0);
+  callbacks_->onReceiveInitialMetadata(std::make_unique<Http::TestResponseHeaderMapImpl>(
+      std::initializer_list<std::pair<std::string, std::string>>{{"lookup-initial", "value"}}));
+  EXPECT_TRUE(callbacks_->onReceiveMessageRaw(std::make_unique<Buffer::OwnedImpl>("response")));
+  receiveTrailers();
+  callbacks_->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Ok, "");
+  EXPECT_EQ(completions_, 1);
+  EXPECT_EQ(completed_id_, id);
+  EXPECT_EQ(status_, Grpc::Status::WellKnownGrpcStatus::Ok);
+  EXPECT_TRUE(has_message_);
+  EXPECT_EQ(response_, "response");
+  EXPECT_THAT(initial_, ElementsAre(std::make_pair("lookup-initial", "value")));
+  EXPECT_THAT(trailing_, ElementsAre(std::make_pair("lookup-trailer", "value")));
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, EmptyResponseIsPresent) {
+  expectStart();
+  uint64_t id = 0;
+  ASSERT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  EXPECT_TRUE(callbacks_->onReceiveMessageRaw(std::make_unique<Buffer::OwnedImpl>()));
+  callbacks_->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Ok, "");
+  EXPECT_EQ(status_, Grpc::Status::WellKnownGrpcStatus::Ok);
+  EXPECT_TRUE(has_message_);
+  EXPECT_TRUE(response_.empty());
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, MissingResponseCannotSucceed) {
+  expectStart();
+  uint64_t id = 0;
+  ASSERT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  callbacks_->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Ok, "");
+  EXPECT_EQ(status_, Grpc::Status::WellKnownGrpcStatus::Internal);
+  EXPECT_FALSE(has_message_);
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, ExtraResponseCannotSucceed) {
+  expectStart();
+  uint64_t id = 0;
+  ASSERT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  EXPECT_TRUE(callbacks_->onReceiveMessageRaw(std::make_unique<Buffer::OwnedImpl>("first")));
+  EXPECT_FALSE(callbacks_->onReceiveMessageRaw(std::make_unique<Buffer::OwnedImpl>("second")));
+  callbacks_->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Ok, "");
+  EXPECT_EQ(status_, Grpc::Status::WellKnownGrpcStatus::Internal);
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, PeerErrorAndInvalidStatusArePreserved) {
+  for (int64_t peer_status :
+       {static_cast<int64_t>(Grpc::Status::WellKnownGrpcStatus::PermissionDenied),
+        static_cast<int64_t>(Grpc::Status::WellKnownGrpcStatus::InvalidCode),
+        static_cast<int64_t>(42)}) {
+    expectStart();
+    uint64_t id = 0;
+    ASSERT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+    receiveTrailers();
+    callbacks_->onRemoteClose(peer_status, "peer error");
+    EXPECT_EQ(status_, peer_status);
+    EXPECT_EQ(message_, "peer error");
+    EXPECT_FALSE(has_message_);
+  }
+  EXPECT_EQ(completions_, 3);
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, LocalDeadlineOverridesNativeStatus) {
+  for (int64_t native_status :
+       {static_cast<int64_t>(Grpc::Status::WellKnownGrpcStatus::Internal),
+        static_cast<int64_t>(Grpc::Status::WellKnownGrpcStatus::Unavailable)}) {
+    expectStart();
+    uint64_t id = 0;
+    ASSERT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+    stream_info_.setResponseFlag(StreamInfo::CoreResponseFlag::UpstreamRequestTimeout);
+    stream_info_.setResponseCodeDetails(StreamInfo::ResponseCodeDetails::get().ResponseTimeout);
+    receiveTrailers();
+    callbacks_->onRemoteClose(native_status, "timeout");
+    EXPECT_EQ(status_, Grpc::Status::WellKnownGrpcStatus::DeadlineExceeded);
+  }
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, TimeoutFlagWithoutLocalDetailsPreservesPeerStatus) {
+  expectStart();
+  uint64_t id = 0;
+  ASSERT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  stream_info_.setResponseFlag(StreamInfo::CoreResponseFlag::UpstreamRequestTimeout);
+  receiveTrailers();
+  callbacks_->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Unavailable, "peer error");
+  EXPECT_EQ(status_, Grpc::Status::WellKnownGrpcStatus::Unavailable);
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, DestructionCancelsHalfClosedRequestAndSuppressesCompletion) {
+  expectStart();
+  uint64_t id = 0;
+  ASSERT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  EXPECT_CALL(stream_, resetStream()).WillOnce(testing::Invoke([this] {
+    callbacks_->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Canceled, "cancelled");
+  }));
+  filter_->onDestroy();
+  filter_->onDestroy();
+  EXPECT_EQ(completions_, 0);
+  EXPECT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument);
+  EXPECT_EQ(id, 0);
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, CompletionMayDestroyParentAndReleaseLastReference) {
+  expectStart();
+  uint64_t id = 0;
+  ASSERT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  EXPECT_TRUE(callbacks_->onReceiveMessageRaw(std::make_unique<Buffer::OwnedImpl>("response")));
+  DynamicModuleHttpFilterWeakPtr weak_filter = filter_;
+  on_completion_ = [this] {
+    filter_->onDestroy();
+    filter_.reset();
+  };
+  callbacks_->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Ok, "");
+  EXPECT_EQ(completions_, 1);
+  EXPECT_FALSE(weak_filter.expired());
+  decoder_callbacks_.dispatcher_.to_delete_.clear();
+  EXPECT_TRUE(weak_filter.expired());
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, NativeClientSurvivesUntilDeferredCleanup) {
+  expectStart();
+  uint64_t id = 0;
+  ASSERT_EQ(start(id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  std::weak_ptr<Grpc::RawAsyncClient> weak_client = client_;
+  client_.reset();
+  callbacks_->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Unavailable, "reset");
+  EXPECT_FALSE(weak_client.expired());
+  decoder_callbacks_.dispatcher_.to_delete_.clear();
+  EXPECT_TRUE(weak_client.expired());
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, SimultaneousCalloutsHaveDifferentIds) {
+  expectStart();
+  uint64_t first_id = 0;
+  ASSERT_EQ(start(first_id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  auto* first_callbacks = callbacks_;
+  expectStart();
+  uint64_t second_id = 0;
+  ASSERT_EQ(start(second_id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  EXPECT_NE(first_id, second_id);
+  auto* second_callbacks = callbacks_;
+  first_callbacks->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Unavailable, "first");
+  EXPECT_EQ(completed_id_, first_id);
+  second_callbacks->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::PermissionDenied, "second");
+  EXPECT_EQ(completed_id_, second_id);
+  EXPECT_EQ(completions_, 2);
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, OrdinaryMetadataUsesEnvoyHeaderHandling) {
+  expectClient();
+  EXPECT_CALL(*client_, startRaw(_, _, _, _))
+      .WillOnce(testing::Invoke(
+          [this](auto, auto, Grpc::RawAsyncStreamCallbacks& callbacks, const auto&) {
+            callbacks_ = &callbacks;
+            Http::TestRequestHeaderMapImpl metadata;
+            callbacks.onCreateInitialMetadata(metadata);
+            const auto values = metadata.get(Http::LowerCaseString("lookup"));
+            EXPECT_EQ(values.size(), 2);
+            EXPECT_EQ(values[0]->value().getStringView(), "one");
+            EXPECT_EQ(values[1]->value().getStringView(), "two");
+            const auto cookies = metadata.get(Http::LowerCaseString("cookie"));
+            EXPECT_EQ(cookies.size(), 1);
+            if (cookies.size() == 1) {
+              EXPECT_EQ(cookies[0]->value().getStringView(), "one; two");
+            }
+            return &stream_;
+          }));
+  EXPECT_CALL(stream_, sendMessageRaw_(_, true));
+  auto metadata = Http::RequestHeaderMapImpl::create();
+  metadata->addCopy(Http::LowerCaseString("lookup"), "one");
+  metadata->addCopy(Http::LowerCaseString("lookup"), "two");
+  metadata->addCopy(Http::LowerCaseString("cookie"), "one");
+  metadata->addCopy(Http::LowerCaseString("cookie"), "two");
+  uint64_t id = 0;
+  ASSERT_EQ(filter_->sendGrpcCallout(&id, "grpc_cluster", "example.Lookup", "Get",
+                                     std::move(metadata), {}, std::make_unique<Buffer::OwnedImpl>(),
+                                     TimeoutMilliseconds, MessageLimit),
+            envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  callbacks_->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Unavailable, "reset");
+}
+
+TEST_F(DynamicModuleGrpcCalloutTest, CompletionMayStartAnotherCallout) {
+  expectStart();
+  uint64_t first_id = 0;
+  ASSERT_EQ(start(first_id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  auto* first_callbacks = callbacks_;
+  expectStart();
+  uint64_t second_id = 0;
+  on_completion_ = [this, &second_id] {
+    EXPECT_EQ(start(second_id), envoy_dynamic_module_type_grpc_callout_init_result_Success);
+  };
+  first_callbacks->onRemoteClose(Grpc::Status::WellKnownGrpcStatus::Unavailable, "reset");
+  EXPECT_NE(first_id, second_id);
+  on_completion_ = nullptr;
+  EXPECT_CALL(stream_, resetStream());
 }
 
 } // namespace HttpFilters

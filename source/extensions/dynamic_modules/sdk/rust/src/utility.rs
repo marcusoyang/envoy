@@ -43,7 +43,7 @@ where
 /// Builds the key and value pair of a filled header entry field by field, so the Rust tuple is
 /// never reinterpreted as the C struct. The buffers point into Envoy owned memory valid for the
 /// current event hook.
-fn header_pair<'a>(header: &AbiHeader) -> (EnvoyBuffer<'a>, EnvoyBuffer<'a>) {
+pub(crate) fn header_pair<'a>(header: &AbiHeader) -> (EnvoyBuffer<'a>, EnvoyBuffer<'a>) {
   unsafe {
     (
       EnvoyBuffer::new_from_raw(header.key_ptr as *const u8, header.key_length),

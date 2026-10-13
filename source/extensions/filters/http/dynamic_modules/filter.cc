@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "envoy/event/dispatcher.h"
+#include "envoy/grpc/async_client_manager.h"
 
 #include "source/common/event/deferred_task.h"
 
@@ -76,6 +77,18 @@ void DynamicModuleHttpFilter::destroy(OptRef<Event::Dispatcher> dispatcher) {
       callout->request_ = nullptr;
       request->cancel();
     }
+  }
+
+  while (!grpc_callouts_.empty()) {
+    auto it = grpc_callouts_.begin();
+    auto callout = std::move(it->second);
+    grpc_callouts_.erase(it);
+    if (callout->stream_ != nullptr) {
+      auto* stream = callout->stream_;
+      callout->stream_ = nullptr;
+      stream->resetStream();
+    }
+    callout->dispatcher_.deferredDelete(std::move(callout));
   }
 
   // Reset all pending streams.
@@ -230,6 +243,142 @@ void DynamicModuleHttpFilter::sendResponseTrailers(ResponseTrailerMapPtr&& trail
 }
 
 void DynamicModuleHttpFilter::encodeComplete() {};
+
+envoy_dynamic_module_type_grpc_callout_init_result DynamicModuleHttpFilter::sendGrpcCallout(
+    uint64_t* callout_id_out, absl::string_view cluster_name, absl::string_view service,
+    absl::string_view method, Http::RequestHeaderMapPtr&& metadata,
+    Http::LowerCaseStrPairVector&& binary_metadata, Buffer::InstancePtr&& request,
+    uint64_t timeout_milliseconds, uint32_t max_message_length) {
+  *callout_id_out = 0;
+  auto* worker_dispatcher = dispatcher();
+  if (destroyed_ || in_module_filter_ == nullptr || worker_dispatcher == nullptr ||
+      config_ == nullptr || config_->on_http_filter_grpc_callout_done_ == nullptr) {
+    return envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument;
+  }
+  if (config_->cluster_manager_.getThreadLocalCluster(cluster_name) == nullptr) {
+    return envoy_dynamic_module_type_grpc_callout_init_result_ClusterNotFound;
+  }
+
+  envoy::config::core::v3::GrpcService grpc_service;
+  grpc_service.mutable_envoy_grpc()->set_cluster_name(cluster_name);
+  grpc_service.mutable_envoy_grpc()->mutable_max_receive_message_length()->set_value(
+      max_message_length);
+  auto client = config_->cluster_manager_.grpcAsyncClientManager().getOrCreateRawAsyncClient(
+      grpc_service, *config_->stats_scope_, true);
+  if (!client.ok()) {
+    return envoy_dynamic_module_type_grpc_callout_init_result_CannotCreateRequest;
+  }
+
+  const uint64_t callout_id = getNextCalloutId();
+  auto callback = std::make_unique<GrpcCalloutCallback>(
+      *this, callout_id, *worker_dispatcher, std::move(client.value()), std::move(metadata),
+      std::move(binary_metadata));
+  Http::AsyncClient::StreamOptions options;
+  options.setTimeout(std::chrono::milliseconds(timeout_milliseconds));
+  callback->stream_ = callback->client_->startRaw(service, method, *callback, options);
+  // The native client can report a failure inline during either starting or sending.
+  if (callback->stream_ != nullptr && !callback->completed_) {
+    callback->stream_->sendMessageRaw(std::move(request), true);
+  }
+  if (callback->stream_ == nullptr || callback->completed_) {
+    worker_dispatcher->deferredDelete(std::move(callback));
+    return envoy_dynamic_module_type_grpc_callout_init_result_CannotCreateRequest;
+  }
+  grpc_callouts_.emplace(callout_id, std::move(callback));
+  *callout_id_out = callout_id;
+  return envoy_dynamic_module_type_grpc_callout_init_result_Success;
+}
+
+void DynamicModuleHttpFilter::GrpcCalloutCallback::onCreateInitialMetadata(
+    Http::RequestHeaderMap& metadata) {
+  request_metadata_->iterate([&metadata](const Http::HeaderEntry& header) {
+    metadata.addCopy(Http::LowerCaseString(header.key().getStringView()),
+                     header.value().getStringView());
+    return Http::HeaderMap::Iterate::Continue;
+  });
+}
+
+Http::LowerCaseStrPairVector
+DynamicModuleHttpFilter::GrpcCalloutCallback::onCreateBinaryInitialMetadata() {
+  return std::move(binary_metadata_);
+}
+
+void DynamicModuleHttpFilter::GrpcCalloutCallback::onReceiveInitialMetadata(
+    Http::ResponseHeaderMapPtr&& metadata) {
+  initial_metadata_ = std::move(metadata);
+}
+
+bool DynamicModuleHttpFilter::GrpcCalloutCallback::onReceiveMessageRaw(
+    Buffer::InstancePtr&& response) {
+  if (response_ != nullptr) {
+    extra_message_ = true;
+    return false;
+  }
+  response_ = std::move(response);
+  return true;
+}
+
+void DynamicModuleHttpFilter::GrpcCalloutCallback::onReceiveTrailingMetadata(
+    Http::ResponseTrailerMapPtr&& metadata) {
+  if (stream_ != nullptr) {
+    const auto& info = stream_->streamInfo();
+    local_timeout_ =
+        info.hasResponseFlag(StreamInfo::CoreResponseFlag::UpstreamRequestTimeout) &&
+        info.responseCodeDetails() == StreamInfo::ResponseCodeDetails::get().ResponseTimeout;
+  }
+  trailing_metadata_ = std::move(metadata);
+}
+
+void DynamicModuleHttpFilter::GrpcCalloutCallback::onRemoteClose(Grpc::Status::GrpcStatus status,
+                                                                 const std::string& message) {
+  completed_ = true;
+  stream_ = nullptr;
+  auto it = filter_.grpc_callouts_.find(callout_id_);
+  if (it == filter_.grpc_callouts_.end()) {
+    return;
+  }
+  auto callback = std::move(it->second);
+  filter_.grpc_callouts_.erase(it);
+  // Native cleanup still accesses the client after this callback returns.
+  auto* pending = callback.get();
+  dispatcher_.deferredDelete(std::move(callback));
+  auto self = filter_.weak_from_this().lock();
+  if (filter_.in_module_filter_ == nullptr) {
+    return;
+  }
+
+  if (local_timeout_) {
+    status = Grpc::Status::WellKnownGrpcStatus::DeadlineExceeded;
+  } else if (status == Grpc::Status::WellKnownGrpcStatus::Ok &&
+             (response_ == nullptr || extra_message_)) {
+    status = Grpc::Status::WellKnownGrpcStatus::Internal;
+  }
+  absl::InlinedVector<envoy_dynamic_module_type_envoy_http_header, 16> initial;
+  absl::InlinedVector<envoy_dynamic_module_type_envoy_http_header, 16> trailing;
+  auto append_metadata = [](const Http::HeaderMap* metadata, auto& output) {
+    if (metadata != nullptr) {
+      metadata->iterate([&output](const Http::HeaderEntry& header) {
+        const auto key = header.key().getStringView();
+        const auto value = header.value().getStringView();
+        output.push_back({const_cast<char*>(key.data()), key.size(),
+                          const_cast<char*>(value.data()), value.size()});
+        return Http::HeaderMap::Iterate::Continue;
+      });
+    }
+  };
+  append_metadata(pending->initial_metadata_.get(), initial);
+  append_metadata(pending->trailing_metadata_.get(), trailing);
+  Buffer::RawSliceVector slices;
+  if (response_ != nullptr) {
+    slices = response_->getRawSlices(std::nullopt);
+  }
+  DynamicModuleHttpFilter::HookScope hook_scope(filter_);
+  filter_.config_->on_http_filter_grpc_callout_done_(
+      filter_.thisAsVoidPtr(), filter_.in_module_filter_, callout_id_, status,
+      {const_cast<char*>(message.data()), message.size()}, initial.data(), initial.size(),
+      reinterpret_cast<envoy_dynamic_module_type_envoy_buffer*>(slices.data()), slices.size(),
+      response_ != nullptr, trailing.data(), trailing.size());
+}
 
 envoy_dynamic_module_type_http_callout_init_result
 DynamicModuleHttpFilter::sendHttpCallout(uint64_t* callout_id_out, absl::string_view cluster_name,

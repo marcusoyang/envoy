@@ -42,6 +42,19 @@ fn new_http_filter_config_fn<EC: EnvoyHttpFilterConfig, EHF: EnvoyHttpFilter>(
     "http_callouts" => Some(Box::new(HttpCalloutsFilterConfig {
       cluster_name: String::from_utf8(config.to_owned()).unwrap(),
     })),
+    "grpc_callout" => {
+      let config = std::str::from_utf8(config).unwrap();
+      let mut fields = config.split(',');
+      let cluster_name = fields.next().unwrap().to_owned();
+      let timeout_milliseconds = fields.next().unwrap().parse().unwrap();
+      let max_message_length = fields.next().unwrap().parse().unwrap();
+      assert!(fields.next().is_none());
+      Some(Box::new(GrpcCalloutConfig {
+        cluster_name,
+        timeout_milliseconds,
+        max_message_length,
+      }))
+    },
     "send_response" => Some(Box::new(SendResponseHttpFilterConfig::new(config))),
     "http_filter_scheduler" => Some(Box::new(HttpFilterSchedulerConfig {})),
     "span_across_callbacks" => Some(Box::new(SpanAcrossCallbacksConfig {})),
@@ -1190,6 +1203,108 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for SendResponseHttpFilter {
       return envoy_dynamic_module_type_on_http_filter_response_headers_status::StopIteration;
     }
     envoy_dynamic_module_type_on_http_filter_response_headers_status::Continue
+  }
+}
+
+struct GrpcCalloutConfig {
+  cluster_name: String,
+  timeout_milliseconds: u64,
+  max_message_length: u32,
+}
+
+impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for GrpcCalloutConfig {
+  fn new_http_filter(&self, _envoy: &mut EHF) -> Box<dyn HttpFilter<EHF>> {
+    Box::new(GrpcCalloutFilter {
+      cluster_name: self.cluster_name.clone(),
+      timeout_milliseconds: self.timeout_milliseconds,
+      max_message_length: self.max_message_length,
+      callout_id: Cell::new(0),
+      completed: Cell::new(false),
+    })
+  }
+}
+
+struct GrpcCalloutFilter {
+  cluster_name: String,
+  timeout_milliseconds: u64,
+  max_message_length: u32,
+  callout_id: Cell<u64>,
+  completed: Cell<bool>,
+}
+
+impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for GrpcCalloutFilter {
+  fn on_request_headers(
+    &self,
+    envoy_filter: &mut EHF,
+    _end_of_stream: bool,
+  ) -> envoy_dynamic_module_type_on_http_filter_request_headers_status {
+    // This is a serialised google.protobuf.StringValue containing "request".
+    const REQUEST_MESSAGE: &[u8] = b"\x0a\x07request";
+    let (result, callout_id) = envoy_filter.send_grpc_callout(
+      &self.cluster_name,
+      "test.Callout",
+      "Fetch",
+      &[
+        ("x-request", b"request-value"),
+        ("request-bin", b"\x00\r\n\xff"),
+      ],
+      REQUEST_MESSAGE,
+      self.timeout_milliseconds,
+      self.max_message_length,
+    );
+    self.callout_id.set(callout_id);
+    if result != envoy_dynamic_module_type_grpc_callout_init_result::Success {
+      let result = format!("{result:?}");
+      envoy_filter.send_response(
+        500,
+        &[("x-grpc-init-result", result.as_bytes())],
+        None,
+        None,
+      );
+    }
+    envoy_dynamic_module_type_on_http_filter_request_headers_status::StopIteration
+  }
+
+  fn on_grpc_callout_done(
+    &self,
+    envoy_filter: &mut EHF,
+    callout_id: u64,
+    response: GrpcCalloutResponse<'_>,
+  ) {
+    assert!(!self.completed.replace(true));
+    assert_eq!(callout_id, self.callout_id.get());
+    let status = response.status.to_string();
+    let present = if response.response_message.is_some() {
+      b"true".as_slice()
+    } else {
+      b"false"
+    };
+    let mut headers = vec![
+      ("x-grpc-status", status.as_bytes()),
+      ("x-grpc-response-present", present),
+      ("x-grpc-status-message", response.status_message.as_slice()),
+    ];
+    for (name, value) in response.initial_metadata {
+      match name.as_slice() {
+        b"x-initial" => headers.push(("x-grpc-initial", value.as_slice())),
+        b"initial-bin" => headers.push(("x-grpc-initial-bin", value.as_slice())),
+        _ => {},
+      }
+    }
+    for (name, value) in response.trailing_metadata {
+      match name.as_slice() {
+        b"x-trailing" => headers.push(("x-grpc-trailing", value.as_slice())),
+        b"trailing-bin" => headers.push(("x-grpc-trailing-bin", value.as_slice())),
+        _ => {},
+      }
+    }
+    let mut message = Vec::new();
+    if let Some(chunks) = response.response_message {
+      for chunk in chunks {
+        message.extend_from_slice(chunk.as_slice());
+      }
+    }
+    envoy_filter.send_response(200, &headers, Some(&message), None);
   }
 }
 

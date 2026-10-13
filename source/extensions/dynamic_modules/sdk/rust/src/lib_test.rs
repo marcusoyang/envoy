@@ -13006,3 +13006,274 @@ fn test_envoy_route_specifier_config_impl() {
     route_specifier::envoy_dynamic_module_on_route_specifier_config_destroy(config_ptr);
   }
 }
+
+struct GrpcCalloutArguments {
+  cluster: String,
+  service: String,
+  method: String,
+  metadata: Vec<(String, Vec<u8>)>,
+  request: Vec<u8>,
+  timeout_milliseconds: u64,
+  max_message_length: u32,
+}
+
+thread_local! {
+  static GRPC_CALLOUT_ARGUMENTS: std::cell::RefCell<Option<GrpcCalloutArguments>> = const {
+    std::cell::RefCell::new(None)
+  };
+}
+
+/// # Safety
+///
+/// The SDK supplies live input slices and a writable ID pointer on this test's thread. The stub
+/// copies those inputs before returning, never aliases a mutable slice, and retains no pointers.
+#[no_mangle]
+pub unsafe extern "C" fn envoy_dynamic_module_callback_http_filter_grpc_callout(
+  _filter: abi::envoy_dynamic_module_type_http_filter_envoy_ptr,
+  callout_id: *mut u64,
+  cluster: abi::envoy_dynamic_module_type_module_buffer,
+  service: abi::envoy_dynamic_module_type_module_buffer,
+  method: abi::envoy_dynamic_module_type_module_buffer,
+  metadata: *mut abi::envoy_dynamic_module_type_module_http_header,
+  metadata_size: usize,
+  request: abi::envoy_dynamic_module_type_module_buffer,
+  timeout_milliseconds: u64,
+  max_message_length: u32,
+) -> abi::envoy_dynamic_module_type_grpc_callout_init_result {
+  let metadata = ffi_helpers::slice_from_raw_or_empty(metadata, metadata_size)
+    .iter()
+    .map(|header| {
+      let name =
+        ffi_helpers::slice_from_raw_or_empty(header.key_ptr as *const u8, header.key_length);
+      let value =
+        ffi_helpers::slice_from_raw_or_empty(header.value_ptr as *const u8, header.value_length);
+      (
+        std::str::from_utf8(name).unwrap().to_owned(),
+        value.to_vec(),
+      )
+    })
+    .collect();
+  GRPC_CALLOUT_ARGUMENTS.with(|capture| {
+    *capture.borrow_mut() = Some(GrpcCalloutArguments {
+      cluster: module_buffer_to_string(cluster),
+      service: module_buffer_to_string(service),
+      method: module_buffer_to_string(method),
+      metadata,
+      request: ffi_helpers::slice_from_raw_or_empty(request.ptr as *const u8, request.length)
+        .to_vec(),
+      timeout_milliseconds,
+      max_message_length,
+    });
+  });
+  *callout_id = 1;
+  abi::envoy_dynamic_module_type_grpc_callout_init_result::Success
+}
+
+#[test]
+fn test_send_grpc_callout_preserves_arguments_and_empty_request() {
+  for request in [b"\x00\xff".as_slice(), b"".as_slice()] {
+    let mut envoy = http::EnvoyHttpFilterImpl::new(std::ptr::null_mut());
+    let (result, callout_id) = envoy.send_grpc_callout(
+      "cluster",
+      "test.Service",
+      "Call",
+      &[("value-bin", b"\x00\xff")],
+      request,
+      1000,
+      1024,
+    );
+    assert_eq!(
+      result,
+      abi::envoy_dynamic_module_type_grpc_callout_init_result::Success
+    );
+    assert_eq!(callout_id, 1);
+    GRPC_CALLOUT_ARGUMENTS.with(|capture| {
+      let arguments = capture.borrow_mut().take().unwrap();
+      assert_eq!(arguments.cluster, "cluster");
+      assert_eq!(arguments.service, "test.Service");
+      assert_eq!(arguments.method, "Call");
+      assert_eq!(
+        arguments.metadata,
+        vec![("value-bin".to_owned(), vec![0, 255])]
+      );
+      assert_eq!(arguments.request, request);
+      assert_eq!(arguments.timeout_milliseconds, 1000);
+      assert_eq!(arguments.max_message_length, 1024);
+    });
+  }
+}
+
+#[test]
+fn test_grpc_callout_ffi_preserves_metadata_presence_and_signed_status() {
+  struct TestConfig {
+    expected_status: i64,
+    expected_message: Option<&'static [u8]>,
+    has_metadata: bool,
+    called: &'static AtomicBool,
+  }
+  impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for TestConfig {
+    fn new_http_filter(&self, _envoy: &mut EHF) -> Box<dyn HttpFilter<EHF>> {
+      Box::new(TestConfig {
+        expected_status: self.expected_status,
+        expected_message: self.expected_message,
+        has_metadata: self.has_metadata,
+        called: self.called,
+      })
+    }
+  }
+  impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for TestConfig {
+    fn on_grpc_callout_done(
+      &self,
+      _envoy: &mut EHF,
+      callout_id: u64,
+      response: GrpcCalloutResponse<'_>,
+    ) {
+      assert_eq!(callout_id, 1);
+      assert_eq!(response.status, self.expected_status);
+      assert_eq!(response.status_message.as_slice(), b"status");
+      if self.has_metadata {
+        let [(initial_name, initial_value)] = response.initial_metadata else {
+          panic!("missing initial metadata")
+        };
+        assert_eq!(initial_name.as_slice(), b"initial-bin");
+        assert_eq!(initial_value.as_slice(), b"AP8=");
+        let [(trailing_name, trailing_value)] = response.trailing_metadata else {
+          panic!("missing trailing metadata")
+        };
+        assert_eq!(trailing_name.as_slice(), b"trailing");
+        assert_eq!(trailing_value.as_slice(), b"value");
+      } else {
+        assert!(response.initial_metadata.is_empty());
+        assert!(response.trailing_metadata.is_empty());
+      }
+      let message = response.response_message.map(|chunks| {
+        chunks
+          .iter()
+          .flat_map(|chunk| chunk.as_slice().iter().copied())
+          .collect::<Vec<_>>()
+      });
+      assert_eq!(message.as_deref(), self.expected_message);
+      self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+  }
+  const INVALID_GRPC_STATUS: i64 = -1;
+  const UNKNOWN_GRPC_STATUS: i64 = 99;
+  const OK_GRPC_STATUS: i64 = 0;
+  for (status, message, has_metadata) in [
+    (INVALID_GRPC_STATUS, None, false),
+    (OK_GRPC_STATUS, Some(b"".as_slice()), true),
+    (UNKNOWN_GRPC_STATUS, Some(b"message".as_slice()), true),
+  ] {
+    static CALLED: AtomicBool = AtomicBool::new(false);
+    CALLED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let config = TestConfig {
+      expected_status: status,
+      expected_message: message,
+      has_metadata,
+      called: &CALLED,
+    };
+    let filter = envoy_dynamic_module_on_http_filter_new_impl(
+      &mut http::EnvoyHttpFilterImpl::new(std::ptr::null_mut()),
+      &config,
+    );
+    let initial = abi::envoy_dynamic_module_type_envoy_http_header {
+      key_ptr: b"initial-bin".as_ptr() as *const _,
+      key_length: b"initial-bin".len(),
+      value_ptr: b"AP8=".as_ptr() as *const _,
+      value_length: b"AP8=".len(),
+    };
+    let trailing = abi::envoy_dynamic_module_type_envoy_http_header {
+      key_ptr: b"trailing".as_ptr() as *const _,
+      key_length: b"trailing".len(),
+      value_ptr: b"value".as_ptr() as *const _,
+      value_length: b"value".len(),
+    };
+    let chunks: Vec<_> = message
+      .filter(|bytes| !bytes.is_empty())
+      .into_iter()
+      .map(|bytes| abi::envoy_dynamic_module_type_envoy_buffer {
+        ptr: bytes.as_ptr() as *const _,
+        length: bytes.len(),
+      })
+      .collect();
+    // SAFETY: The SDK created this worker-local filter handle. All arrays and their borrowed
+    // static bytes stay live and unchanged until the callback returns. Destroy releases the SDK
+    // handle afterwards; the test never retains or frees Envoy buffer pointers.
+    unsafe {
+      http::envoy_dynamic_module_on_http_filter_grpc_callout_done(
+        std::ptr::null_mut(),
+        filter,
+        1,
+        status,
+        abi::envoy_dynamic_module_type_envoy_buffer {
+          ptr: b"status".as_ptr() as *const _,
+          length: b"status".len(),
+        },
+        if has_metadata {
+          &initial
+        } else {
+          std::ptr::null()
+        },
+        usize::from(has_metadata),
+        if chunks.is_empty() {
+          std::ptr::null()
+        } else {
+          chunks.as_ptr()
+        },
+        chunks.len(),
+        message.is_some(),
+        if has_metadata {
+          &trailing
+        } else {
+          std::ptr::null()
+        },
+        usize::from(has_metadata),
+      );
+      envoy_dynamic_module_on_http_filter_destroy(filter);
+    }
+    assert!(CALLED.load(std::sync::atomic::Ordering::SeqCst));
+  }
+}
+
+#[test]
+fn test_catch_unwind_grpc_callout_forwards_then_poison_skips() {
+  struct TestFilter {
+    calls: std::rc::Rc<std::cell::Cell<usize>>,
+  }
+  impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for TestFilter {
+    fn on_grpc_callout_done(
+      &self,
+      _envoy: &mut EHF,
+      callout_id: u64,
+      response: GrpcCalloutResponse<'_>,
+    ) {
+      self.calls.set(self.calls.get() + 1);
+      assert_eq!(callout_id, 1);
+      assert_eq!(response.status, -1);
+      assert!(response.response_message.is_some());
+      if self.calls.get() > 1 {
+        panic!("test callback panic")
+      }
+    }
+  }
+  let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+  let wrapper = CatchUnwind::new(TestFilter {
+    calls: calls.clone(),
+  });
+  let mut envoy = http::MockEnvoyHttpFilter::new();
+  envoy.expect_reset_stream().times(1).returning(|_, _| {});
+  for _ in 0..3 {
+    wrapper.on_grpc_callout_done(
+      &mut envoy,
+      1,
+      GrpcCalloutResponse {
+        status: -1,
+        status_message: EnvoyBuffer::default(),
+        initial_metadata: &[],
+        response_message: Some(&[]),
+        trailing_metadata: &[],
+      },
+    );
+  }
+  assert_eq!(calls.get(), 2);
+}

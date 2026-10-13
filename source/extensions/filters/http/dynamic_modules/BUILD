@@ -34,6 +34,8 @@ envoy_cc_library(
     deps = [
         ":filter_config_lib",
         "//envoy/event:dispatcher_interface",
+        "//envoy/grpc:async_client_interface",
+        "//envoy/grpc:async_client_manager_interface",
         "//source/common/event:deferred_task",
         "//source/common/tracing:null_span_lib",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
@@ -67,7 +69,9 @@ envoy_cc_library(
     srcs = ["abi_impl.cc"],
     deps = [
         ":filter_lib",
+        "//envoy/http:codec_runtime_overrides",
         "//envoy/registry",
+        "//source/common/http:headers_lib",
         "//source/common/http:utility_lib",
         "//source/common/network:upstream_socket_options_filter_state_lib",
         "//source/common/router:string_accessor_lib",
@@ -78,6 +82,8 @@ envoy_cc_library(
         "//source/extensions/dynamic_modules:abi_impl",
         "//source/extensions/dynamic_modules:dynamic_modules_lib",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
+        "@abseil-cpp//absl/container:flat_hash_set",
+        "@abseil-cpp//absl/strings",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],
     alwayslink = True,

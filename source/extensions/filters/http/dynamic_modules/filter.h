@@ -5,6 +5,7 @@
 
 #include "envoy/common/optref.h"
 #include "envoy/event/dispatcher.h"
+#include "envoy/grpc/async_client.h"
 
 #include "source/common/tracing/null_span_impl.h"
 #include "source/extensions/dynamic_modules/dynamic_modules.h"
@@ -242,6 +243,16 @@ public:
   void continueEncoding();
 
   /**
+   * Sends a unary gRPC callout through the worker-local native client.
+   */
+  envoy_dynamic_module_type_grpc_callout_init_result
+  sendGrpcCallout(uint64_t* callout_id_out, absl::string_view cluster_name,
+                  absl::string_view service, absl::string_view method,
+                  Http::RequestHeaderMapPtr&& metadata,
+                  Http::LowerCaseStrPairVector&& binary_metadata, Buffer::InstancePtr&& request,
+                  uint64_t timeout_milliseconds, uint32_t max_message_length);
+
+  /**
    * Sends an HTTP callout to the specified cluster with the given message.
    */
   envoy_dynamic_module_type_http_callout_init_result
@@ -393,6 +404,38 @@ private:
     DynamicModuleHttpFilter& filter_;
   };
 
+  class GrpcCalloutCallback : public Grpc::RawAsyncStreamCallbacks,
+                              public Event::DeferredDeletable {
+  public:
+    GrpcCalloutCallback(DynamicModuleHttpFilter& filter, uint64_t id, Event::Dispatcher& dispatcher,
+                        Grpc::RawAsyncClientSharedPtr client, Http::RequestHeaderMapPtr&& metadata,
+                        Http::LowerCaseStrPairVector&& binary_metadata)
+        : filter_(filter), callout_id_(id), dispatcher_(dispatcher), client_(std::move(client)),
+          request_metadata_(std::move(metadata)), binary_metadata_(std::move(binary_metadata)) {}
+
+    void onCreateInitialMetadata(Http::RequestHeaderMap& metadata) override;
+    Http::LowerCaseStrPairVector onCreateBinaryInitialMetadata() override;
+    void onReceiveInitialMetadata(Http::ResponseHeaderMapPtr&& metadata) override;
+    bool onReceiveMessageRaw(Buffer::InstancePtr&& response) override;
+    void onReceiveTrailingMetadata(Http::ResponseTrailerMapPtr&& metadata) override;
+    void onRemoteClose(Grpc::Status::GrpcStatus status, const std::string& message) override;
+
+    DynamicModuleHttpFilter& filter_;
+    const uint64_t callout_id_;
+    Event::Dispatcher& dispatcher_;
+    // Retain the worker-local client until native stream cleanup has returned.
+    Grpc::RawAsyncClientSharedPtr client_;
+    Grpc::RawAsyncStream* stream_ = nullptr;
+    Http::RequestHeaderMapPtr request_metadata_;
+    Http::LowerCaseStrPairVector binary_metadata_;
+    Http::ResponseHeaderMapPtr initial_metadata_;
+    Http::ResponseTrailerMapPtr trailing_metadata_;
+    Buffer::InstancePtr response_;
+    bool completed_ = false;
+    bool extra_message_ = false;
+    bool local_timeout_ = false;
+  };
+
   uint64_t getNextCalloutId() { return next_callout_id_++; }
 
   uint64_t next_callout_id_ = 1; // 0 is reserved as an invalid id.
@@ -403,6 +446,8 @@ private:
   // unique identifier. We store the callback objects here to manage their lifetime.
   absl::flat_hash_map<uint64_t, std::unique_ptr<DynamicModuleHttpFilter::HttpStreamCalloutCallback>>
       http_stream_callouts_;
+
+  absl::flat_hash_map<uint64_t, std::unique_ptr<GrpcCalloutCallback>> grpc_callouts_;
 
   // Socket options storage for HTTP filters.
   struct StoredSocketOption {

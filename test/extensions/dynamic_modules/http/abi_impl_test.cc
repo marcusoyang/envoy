@@ -9,8 +9,10 @@
 
 #include "envoy/common/logger.h"
 #include "envoy/extensions/transport_sockets/tls/v3/secret.pb.h"
+#include "envoy/http/codec_runtime_overrides.h"
 #include "envoy/registry/registry.h"
 
+#include "source/common/http/headers.h"
 #include "source/common/network/address_impl.h"
 #include "source/common/router/string_accessor_impl.h"
 #include "source/extensions/filters/http/dynamic_modules/filter.h"
@@ -32,6 +34,7 @@
 #include "test/mocks/upstream/thread_local_cluster.h"
 #include "test/test_common/status_utility.h"
 #include "test/test_common/struct_matchers.h"
+#include "test/test_common/threadsafe_singleton_injector.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
@@ -5608,6 +5611,222 @@ TEST_F(DynamicModuleHttpFilterSchedulerTest,
   captured_cb();
 
   envoy_dynamic_module_callback_http_filter_scheduler_delete(scheduler);
+}
+
+class DynamicModuleGrpcCalloutAbiTest : public DynamicModuleHttpFilterTest {
+public:
+  void SetUp() override {
+    DynamicModuleHttpFilterTest::SetUp();
+    config_ = std::make_shared<DynamicModuleHttpFilterConfig>(
+        "grpc", "", DefaultMetricsNamespace, nullptr, *stats_store_.createScope(""), context_);
+    config_->in_module_config_ = this;
+    config_->on_http_filter_new_ = [](auto config, auto) { return config; };
+    config_->on_http_filter_destroy_ = [](auto) {};
+    config_->on_http_filter_grpc_callout_done_ =
+        [](auto, auto, uint64_t, int64_t, envoy_dynamic_module_type_envoy_buffer,
+           envoy_dynamic_module_type_envoy_http_header*, size_t,
+           envoy_dynamic_module_type_envoy_buffer*, size_t, bool,
+           envoy_dynamic_module_type_envoy_http_header*, size_t) {};
+    filter_ = std::make_unique<DynamicModuleHttpFilter>(config_, symbol_table_, 0);
+    filter_->setDecoderFilterCallbacks(decoder_callbacks_);
+    filter_->initializeInModuleFilter();
+  }
+
+  void TearDown() override {
+    filter_->onDestroy();
+    filter_.reset();
+    decoder_callbacks_.dispatcher_.to_delete_.clear();
+  }
+
+  envoy_dynamic_module_type_grpc_callout_init_result
+  call(envoy_dynamic_module_type_module_buffer service = {const_cast<char*>("example.Lookup"), 14},
+       envoy_dynamic_module_type_module_buffer method = {const_cast<char*>("Get"), 3},
+       envoy_dynamic_module_type_module_http_header* metadata = nullptr, size_t metadata_size = 0,
+       envoy_dynamic_module_type_module_buffer request = {nullptr, 0}, uint64_t timeout = 250,
+       uint32_t limit = 1024) {
+    id_ = 99;
+    auto result = envoy_dynamic_module_callback_http_filter_grpc_callout(
+        filter_.get(), &id_, {const_cast<char*>("cluster"), 7}, service, method, metadata,
+        metadata_size, request, timeout, limit);
+    EXPECT_EQ(id_, 0);
+    return result;
+  }
+
+  NiceMock<Server::Configuration::MockServerFactoryContext> context_;
+  Stats::IsolatedStoreImpl stats_store_;
+  DynamicModuleHttpFilterConfigSharedPtr config_;
+  uint64_t id_ = 0;
+};
+
+TEST_F(DynamicModuleGrpcCalloutAbiTest, ValidInputsReachClusterLookup) {
+  EXPECT_CALL(context_.cluster_manager_, getThreadLocalCluster("cluster"))
+      .WillOnce(testing::Return(nullptr));
+  EXPECT_EQ(call(), envoy_dynamic_module_type_grpc_callout_init_result_ClusterNotFound);
+}
+
+TEST_F(DynamicModuleGrpcCalloutAbiTest, RejectsInvalidNamesAndPointersBeforeClientLookup) {
+  constexpr auto InvalidArgument =
+      envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument;
+  EXPECT_CALL(context_.cluster_manager_, getThreadLocalCluster(_)).Times(0);
+  for (std::string invalid : {"", "bad/service", "bad service", "bad\nservice", "bad-service"}) {
+    EXPECT_EQ(call({invalid.data(), invalid.size()}), InvalidArgument);
+  }
+  for (std::string invalid : {"", "bad/method", "bad.method", "bad method", "bad\nmethod"}) {
+    EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {invalid.data(), invalid.size()}),
+              InvalidArgument);
+  }
+  EXPECT_EQ(call({nullptr, 1}), InvalidArgument);
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {nullptr, 1}), InvalidArgument);
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, nullptr, 1),
+            InvalidArgument);
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, nullptr, 0,
+                 {nullptr, 1}),
+            InvalidArgument);
+  std::string oversized(Http::DEFAULT_MAX_REQUEST_HEADERS_KB * 1024, 'a');
+  EXPECT_EQ(call({oversized.data(), oversized.size()}), InvalidArgument);
+  EXPECT_EQ(envoy_dynamic_module_callback_http_filter_grpc_callout(
+                nullptr, &id_, {const_cast<char*>("cluster"), 7}, {const_cast<char*>("Service"), 7},
+                {const_cast<char*>("Get"), 3}, nullptr, 0, {nullptr, 0}, 250, 1024),
+            InvalidArgument);
+  EXPECT_EQ(envoy_dynamic_module_callback_http_filter_grpc_callout(
+                filter_.get(), nullptr, {const_cast<char*>("cluster"), 7},
+                {const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, nullptr, 0,
+                {nullptr, 0}, 250, 1024),
+            InvalidArgument);
+  EXPECT_EQ(envoy_dynamic_module_callback_http_filter_grpc_callout(
+                filter_.get(), &id_, {nullptr, 0}, {const_cast<char*>("Service"), 7},
+                {const_cast<char*>("Get"), 3}, nullptr, 0, {nullptr, 0}, 250, 1024),
+            InvalidArgument);
+}
+
+TEST_F(DynamicModuleGrpcCalloutAbiTest, RequiresFinitePositiveTimeoutAndMessageLimit) {
+  constexpr auto InvalidArgument =
+      envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument;
+  EXPECT_CALL(context_.cluster_manager_, getThreadLocalCluster(_)).Times(0);
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, nullptr, 0,
+                 {nullptr, 0}, 0),
+            InvalidArgument);
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, nullptr, 0,
+                 {nullptr, 0}, std::numeric_limits<uint64_t>::max()),
+            InvalidArgument);
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, nullptr, 0,
+                 {nullptr, 0}, 250, 0),
+            InvalidArgument);
+  std::string large_request(1025, 'a');
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, nullptr, 0,
+                 {large_request.data(), large_request.size()}),
+            InvalidArgument);
+}
+
+TEST_F(DynamicModuleGrpcCalloutAbiTest, RejectsReservedOrMalformedMetadata) {
+  constexpr auto InvalidArgument =
+      envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument;
+  EXPECT_CALL(context_.cluster_manager_, getThreadLocalCluster(_)).Times(0);
+  for (std::string key : {"", "Uppercase", ":path", "grpc-status", "content-type", "te", "host",
+                          "connection", "content-length", "bad/key"}) {
+    envoy_dynamic_module_type_module_http_header entry{key.data(), key.size(),
+                                                       const_cast<char*>("value"), 5};
+    EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, &entry, 1),
+              InvalidArgument);
+  }
+  std::string invalid_value = "bad\nvalue";
+  envoy_dynamic_module_type_module_http_header entry{const_cast<char*>("lookup"), 6,
+                                                     invalid_value.data(), invalid_value.size()};
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, &entry, 1),
+            InvalidArgument);
+  entry.key_ptr = nullptr;
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, &entry, 1),
+            InvalidArgument);
+  entry = {const_cast<char*>("lookup"), 6, nullptr, 1};
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, &entry, 1),
+            InvalidArgument);
+}
+
+TEST_F(DynamicModuleGrpcCalloutAbiTest, RejectsEnvoyTimeoutAndRetryOverrides) {
+  EXPECT_CALL(context_.cluster_manager_, getThreadLocalCluster(_)).Times(0);
+  for (const auto& [name, value] : std::vector<std::pair<std::string, std::string>>{
+           {"x-envoy-upstream-rq-timeout-ms", "0"},
+           {"x-envoy-upstream-rq-per-try-timeout-ms", "0"},
+           {"x-envoy-retry-on", "5xx"},
+           {"x-envoy-retry-grpc-on", "unavailable"},
+           {"x-envoy-max-retries", "3"}}) {
+    envoy_dynamic_module_type_module_http_header entry{
+        const_cast<char*>(name.data()), name.size(), const_cast<char*>(value.data()), value.size()};
+    EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, &entry, 1),
+              envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument);
+  }
+}
+
+TEST_F(DynamicModuleGrpcCalloutAbiTest, RejectsConfiguredControlPrefixRegardlessOfCase) {
+  Http::PrefixValue prefix;
+  prefix.setPrefix("X-Custom");
+  TestThreadsafeSingletonInjector<Http::PrefixValue> prefix_injector(&prefix);
+  EXPECT_CALL(context_.cluster_manager_, getThreadLocalCluster(_)).Times(0);
+  std::string key = "x-custom-upstream-rq-timeout-ms";
+  envoy_dynamic_module_type_module_http_header entry{key.data(), key.size(), const_cast<char*>("0"),
+                                                     1};
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, &entry, 1),
+            envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument);
+}
+
+TEST_F(DynamicModuleGrpcCalloutAbiTest, BoundsMetadataBeforeCopyingAndBase64Expansion) {
+  constexpr auto InvalidArgument =
+      envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument;
+  EXPECT_CALL(context_.cluster_manager_, getThreadLocalCluster(_)).Times(0);
+  std::string oversized(Http::DEFAULT_MAX_REQUEST_HEADERS_KB * 1024, 'a');
+  envoy_dynamic_module_type_module_http_header entry{const_cast<char*>("lookup"), 6,
+                                                     oversized.data(), oversized.size()};
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, &entry, 1),
+            InvalidArgument);
+  entry = {oversized.data(), oversized.size(), nullptr, 0};
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, &entry, 1),
+            InvalidArgument);
+  std::string binary(Http::DEFAULT_MAX_REQUEST_HEADERS_KB * 1024 * 3 / 4, '\0');
+  entry = {const_cast<char*>("lookup-bin"), 10, binary.data(), binary.size()};
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, &entry, 1),
+            InvalidArgument);
+  entry.value_length = std::numeric_limits<size_t>::max();
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, &entry, 1),
+            InvalidArgument);
+  std::vector<envoy_dynamic_module_type_module_http_header> entries(
+      Http::DEFAULT_MAX_HEADERS_COUNT, {const_cast<char*>("lookup"), 6, nullptr, 0});
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, entries.data(),
+                 entries.size()),
+            InvalidArgument);
+}
+
+TEST_F(DynamicModuleGrpcCalloutAbiTest, ReservesHeadersAddedByNativeClientAndRouting) {
+  constexpr size_t NativeAndRoutingHeaderCount = 10;
+  std::vector<envoy_dynamic_module_type_module_http_header> entries(
+      Http::DEFAULT_MAX_HEADERS_COUNT - NativeAndRoutingHeaderCount,
+      {const_cast<char*>("lookup"), 6, nullptr, 0});
+  EXPECT_CALL(context_.cluster_manager_, getThreadLocalCluster("cluster"))
+      .WillOnce(testing::Return(nullptr));
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, entries.data(),
+                 entries.size()),
+            envoy_dynamic_module_type_grpc_callout_init_result_ClusterNotFound);
+  entries.push_back(entries.front());
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, entries.data(),
+                 entries.size()),
+            envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument);
+}
+
+TEST_F(DynamicModuleGrpcCalloutAbiTest, RejectsDuplicateBinaryMetadataAndAllowsOrdinaryDuplicates) {
+  envoy_dynamic_module_type_module_http_header binary[] = {
+      {const_cast<char*>("lookup-bin"), 10, const_cast<char*>("\0\xff"), 2},
+      {const_cast<char*>("lookup-bin"), 10, nullptr, 0}};
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, binary, 2),
+            envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument);
+  EXPECT_CALL(context_.cluster_manager_, getThreadLocalCluster("cluster"))
+      .Times(2)
+      .WillRepeatedly(testing::Return(nullptr));
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, binary, 1),
+            envoy_dynamic_module_type_grpc_callout_init_result_ClusterNotFound);
+  envoy_dynamic_module_type_module_http_header ordinary[] = {
+      {const_cast<char*>("lookup"), 6, const_cast<char*>("one"), 3},
+      {const_cast<char*>("lookup"), 6, const_cast<char*>("two"), 3}};
+  EXPECT_EQ(call({const_cast<char*>("Service"), 7}, {const_cast<char*>("Get"), 3}, ordinary, 2),
+            envoy_dynamic_module_type_grpc_callout_init_result_ClusterNotFound);
 }
 
 } // namespace HttpFilters

@@ -271,6 +271,35 @@ TEST_F(EnvoyAsyncClientImplTest, BinaryMetadataInClientInitialMetadataIsBase64Es
   EXPECT_EQ(grpc_stream, nullptr);
 }
 
+TEST_F(EnvoyAsyncClientImplTest, RawBinaryInitialMetadataIsBase64EscapedBeforeCreatingHeaders) {
+  class BinaryMetadataCallbacks : public MockAsyncStreamCallbacks<helloworld::HelloReply> {
+  public:
+    Http::LowerCaseStrPairVector onCreateBinaryInitialMetadata() override {
+      return {{Http::LowerCaseString("raw-bytes-bin"), std::string("\0\r\n\xff", 4)}};
+    }
+  };
+  StrictMock<BinaryMetadataCallbacks> grpc_callbacks;
+  StrictMock<Http::MockAsyncClientStream> http_stream;
+  EXPECT_CALL(http_client_, start(_, _)).WillOnce(Return(&http_stream));
+  EXPECT_CALL(grpc_callbacks, onCreateInitialMetadata(_))
+      .WillOnce(Invoke([](Http::RequestHeaderMap& headers) {
+        headers.addCopy(Http::LowerCaseString("text-bin"), "plain text");
+      }));
+  EXPECT_CALL(http_stream, sendHeaders(_, false))
+      .WillOnce(Invoke([](Http::RequestHeaderMap& headers, bool) {
+        EXPECT_EQ(headers.get(Http::LowerCaseString("raw-bytes-bin"))[0]->value().getStringView(),
+                  "AA0K/w==");
+        EXPECT_EQ(headers.get(Http::LowerCaseString("text-bin"))[0]->value().getStringView(),
+                  "cGxhaW4gdGV4dA==");
+      }));
+  auto grpc_stream =
+      grpc_client_->start(*method_descriptor_, grpc_callbacks, Http::AsyncClient::StreamOptions());
+  ASSERT_NE(grpc_stream, nullptr);
+
+  EXPECT_CALL(http_stream, reset());
+  grpc_stream->resetStream();
+}
+
 // Validates that "*-bin" server init metadata are NOT based64 decoded.
 // See https://github.com/envoyproxy/envoy/issues/39054, we don't want arbitrary binary header
 // values gets into Envoy before that's well understood by folks.
@@ -673,6 +702,70 @@ TEST_F(EnvoyAsyncClientImplTest, MultipleFramesWithResetInBetween) {
       .WillOnce(Invoke([&](const helloworld::HelloReply&) { grpc_stream->resetStream(); }));
 
   http_callbacks->onData(data, false);
+}
+
+TEST_F(EnvoyAsyncClientImplTest, IncompleteFrameAtTrailers) {
+  const std::vector<absl::string_view> incomplete_frames = {
+      absl::string_view("\0\0", 2),         // An incomplete frame header.
+      absl::string_view("\0\0\0\0\2x", 6)}; // A two-byte message with only one byte received.
+  for (const auto incomplete_frame : incomplete_frames) {
+    for (const bool has_complete_message : {false, true}) {
+      for (const auto peer_status :
+           {Status::WellKnownGrpcStatus::Ok, Status::WellKnownGrpcStatus::Canceled}) {
+        SCOPED_TRACE(testing::Message() << "partial bytes: " << incomplete_frame.size()
+                                        << ", complete message: " << has_complete_message
+                                        << ", peer status: " << peer_status);
+        StrictMock<MockAsyncStreamCallbacks<helloworld::HelloReply>> grpc_callbacks;
+        StrictMock<Http::MockAsyncClientStream> http_stream;
+        Http::AsyncClient::StreamCallbacks* http_callbacks = nullptr;
+        StreamInfo::StreamInfoImpl stream_info{context_.time_system_, nullptr,
+                                               StreamInfo::FilterState::LifeSpan::FilterChain};
+        EXPECT_CALL(Const(http_stream), streamInfo()).WillRepeatedly(ReturnRef(stream_info));
+        EXPECT_CALL(http_client_, start(_, _))
+            .WillOnce(Invoke([&](Http::AsyncClient::StreamCallbacks& callbacks,
+                                 const Http::AsyncClient::StreamOptions&) {
+              http_callbacks = &callbacks;
+              return &http_stream;
+            }));
+        EXPECT_CALL(http_stream, sendHeaders(_, false));
+        EXPECT_CALL(grpc_callbacks, onCreateInitialMetadata(_));
+        auto grpc_stream = grpc_client_->start(*method_descriptor_, grpc_callbacks,
+                                               Http::AsyncClient::StreamOptions());
+        ASSERT_NE(grpc_stream, nullptr);
+
+        EXPECT_CALL(grpc_callbacks, onReceiveInitialMetadata_(_));
+        http_callbacks->onHeaders(std::make_unique<Http::TestResponseHeaderMapImpl>(
+                                      Http::TestResponseHeaderMapImpl{{":status", "200"}}),
+                                  false);
+        Buffer::OwnedImpl data;
+        if (has_complete_message) {
+          const uint8_t flags = 0;
+          const uint32_t length = 0;
+          data.add(&flags, sizeof(flags));
+          data.add(&length, sizeof(length));
+        }
+        data.add(incomplete_frame);
+        EXPECT_CALL(grpc_callbacks, onReceiveMessage_(_)).Times(has_complete_message ? 1 : 0);
+        http_callbacks->onData(data, false);
+
+        EXPECT_CALL(grpc_callbacks, onReceiveTrailingMetadata_(_))
+            .WillOnce(Invoke([](const Http::ResponseTrailerMap& trailers) {
+              EXPECT_EQ(trailers.get(Http::LowerCaseString("response-metadata"))[0]
+                            ->value()
+                            .getStringView(),
+                        "preserved");
+            }));
+        const auto expected_status = peer_status == Status::WellKnownGrpcStatus::Ok
+                                         ? Status::WellKnownGrpcStatus::Internal
+                                         : peer_status;
+        EXPECT_CALL(grpc_callbacks, onRemoteClose(expected_status, ""));
+        EXPECT_CALL(http_stream, reset());
+        http_callbacks->onTrailers(
+            std::make_unique<Http::TestResponseTrailerMapImpl>(Http::TestResponseTrailerMapImpl{
+                {"grpc-status", std::to_string(peer_status)}, {"response-metadata", "preserved"}}));
+      }
+    }
+  }
 }
 
 // Helper that starts a stream successfully and hands back the HTTP-level callbacks so the test can

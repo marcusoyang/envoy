@@ -60,16 +60,16 @@ public:
   /**
    * Send request message to the stream.
    * @param request serialized message.
-   * @param end_stream close the stream locally. No further methods may be invoked on the stream
-   *                   object, but callbacks may still be received until the stream is closed
-   *                   remotely.
+   * @param end_stream close the stream locally. No further writes may be made to the stream.
+   *                   The caller may still query or reset it, and callbacks may still be received
+   *                   until the stream is closed remotely.
    */
   virtual void sendMessageRaw(Buffer::InstancePtr&& request, bool end_stream) PURE;
 
   /**
-   * Close the stream locally and send an empty DATA frame to the remote. No further methods may be
-   * invoked on the stream object, but callbacks may still be received until the stream is closed
-   * remotely.
+   * Close the stream locally and send an empty DATA frame to the remote. No further writes may be
+   * made to the stream. The caller may still query or reset it, and callbacks may still be received
+   * until the stream is closed remotely.
    */
   virtual void closeStream() PURE;
 
@@ -157,6 +157,14 @@ public:
    * @param metadata initial metadata reference.
    */
   virtual void onCreateInitialMetadata(Http::RequestHeaderMap& metadata) PURE;
+
+  /**
+   * Called by the Envoy gRPC client for initial metadata with arbitrary binary values.
+   * Keys must end in "-bin". Values are raw bytes, which the client base64-encodes before adding
+   * them to the request headers. This callback follows onCreateInitialMetadata().
+   * @return Http::LowerCaseStrPairVector the binary metadata to send, or an empty vector.
+   */
+  virtual Http::LowerCaseStrPairVector onCreateBinaryInitialMetadata() { return {}; }
 
   /**
    * Called when initial metadata is received. This will be called with empty metadata on a

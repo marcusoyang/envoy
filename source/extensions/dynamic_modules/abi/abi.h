@@ -327,6 +327,18 @@ typedef enum envoy_dynamic_module_type_http_callout_init_result {
 } envoy_dynamic_module_type_http_callout_init_result;
 
 /**
+ * The result of starting a unary gRPC callout. A failed start sets the callout ID to zero and
+ * does not invoke the completion hook. InvalidArgument includes invalid inputs or a filter that
+ * is not fully constructed and attached, is destroyed, or does not export the completion hook.
+ */
+typedef enum envoy_dynamic_module_type_grpc_callout_init_result {
+  envoy_dynamic_module_type_grpc_callout_init_result_Success,
+  envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument,
+  envoy_dynamic_module_type_grpc_callout_init_result_ClusterNotFound,
+  envoy_dynamic_module_type_grpc_callout_init_result_CannotCreateRequest,
+} envoy_dynamic_module_type_grpc_callout_init_result;
+
+/**
  * envoy_dynamic_module_type_http_callout_result represents the result of the HTTP callout.
  * This corresponds to `AsyncClient::FailureReason::*` in envoy/http/async_client.h plus Success.
  */
@@ -1274,6 +1286,40 @@ void envoy_dynamic_module_on_http_filter_http_callout_done(
     envoy_dynamic_module_type_http_callout_result result,
     envoy_dynamic_module_type_envoy_http_header* headers, size_t headers_size,
     envoy_dynamic_module_type_envoy_buffer* body_chunks, size_t body_chunks_size);
+
+/**
+ * Completes a unary gRPC callout on the worker that started it. This hook is optional: a module
+ * without it can still load, but cannot start gRPC callouts. Envoy invokes it at most once after
+ * a successful start returns. Destroying the parent HTTP filter cancels the call without a hook.
+ *
+ * All buffers and arrays are borrowed from Envoy and valid only until this hook returns. The
+ * module must not retain them. Empty arrays may be null. The hook may start another callout or
+ * end the parent HTTP stream.
+ *
+ * @param filter_envoy_ptr is the corresponding Envoy HTTP filter.
+ * @param filter_module_ptr is the corresponding in-module HTTP filter.
+ * @param callout_id is the nonzero ID returned by the start callback.
+ * @param status is the final signed gRPC status, including native unknown values and -1 for an
+ * invalid status. An OK response must contain exactly one complete message, otherwise status is
+ * INTERNAL. An Envoy whole-response timeout is reported as DEADLINE_EXCEEDED.
+ * @param status_message is the peer or native error message. It may contain sensitive data.
+ * @param initial_metadata is the received initial metadata, including protocol headers.
+ * @param initial_metadata_size is the number of initial metadata entries.
+ * @param response_chunks are the serialised response message slices, when a message was received.
+ * @param response_chunks_size is the number of message slices.
+ * @param has_response_message distinguishes an empty message from no message.
+ * @param trailing_metadata is the received trailing metadata, including protocol headers.
+ * @param trailing_metadata_size is the number of trailing metadata entries. Response binary
+ * metadata remains base64 encoded, matching Envoy's native gRPC client.
+ */
+void envoy_dynamic_module_on_http_filter_grpc_callout_done(
+    envoy_dynamic_module_type_http_filter_envoy_ptr filter_envoy_ptr,
+    envoy_dynamic_module_type_http_filter_module_ptr filter_module_ptr, uint64_t callout_id,
+    int64_t status, envoy_dynamic_module_type_envoy_buffer status_message,
+    envoy_dynamic_module_type_envoy_http_header* initial_metadata, size_t initial_metadata_size,
+    envoy_dynamic_module_type_envoy_buffer* response_chunks, size_t response_chunks_size,
+    bool has_response_message, envoy_dynamic_module_type_envoy_http_header* trailing_metadata,
+    size_t trailing_metadata_size);
 
 /**
  * envoy_dynamic_module_on_http_filter_http_stream_headers is called when response headers are
@@ -3140,6 +3186,48 @@ envoy_dynamic_module_callback_http_filter_http_callout(
     envoy_dynamic_module_type_module_buffer cluster_name,
     envoy_dynamic_module_type_module_http_header* headers, size_t headers_size,
     envoy_dynamic_module_type_module_buffer body, uint64_t timeout_milliseconds);
+
+/**
+ * Starts an asynchronous unary gRPC call through Envoy's native client and a configured HTTP/2
+ * cluster. Call only on the filter's worker after construction and callback attachment. Envoy
+ * copies all input before returning. The request is one serialised protobuf message, which may
+ * be empty. No protobuf schema is required by Envoy.
+ *
+ * Application metadata names must be lowercase ASCII letters, digits, underscore, dot or hyphen.
+ * Pseudoheaders, grpc-* names, Envoy control headers and protocol headers are rejected. Envoy
+ * control headers use x-envoy-* by default, or the configured header prefix.
+ * Ordinary values must be printable
+ * ASCII. Values with a -bin key are raw bytes, encoded by the native client; duplicate -bin keys
+ * are rejected. Ordinary keys follow Envoy's HTTP header handling: custom duplicates are kept,
+ * while duplicates of built-in headers may be combined. Envoy bounds caller-supplied names and
+ * metadata using the default request-header size and count limits before native client processing.
+ * Incoming metadata is bounded by the cluster's
+ * max_response_headers_kb and common HTTP protocol max_headers_count settings.
+ *
+ * @param filter_envoy_ptr is the corresponding Envoy HTTP filter.
+ * @param callout_id_out receives a nonzero ID on success, or zero on failure.
+ * @param cluster_name is the nonempty configured cluster name.
+ * @param service is a nonempty service path component using ASCII letters, digits, underscore
+ * and dot.
+ * @param method is a nonempty method path component using ASCII letters, digits and underscore.
+ * @param metadata is the application request metadata; it may be null when metadata_size is zero.
+ * @param metadata_size is the number of metadata entries.
+ * @param request_bytes is the serialised protobuf request. Its pointer may be null if empty.
+ * @param timeout_milliseconds is a positive whole-response timeout representable as milliseconds.
+ * @param max_message_length is a positive byte limit for the request and each decoded response
+ * message. Keep this limit fixed in module configuration: it participates in Envoy's native client
+ * cache key. The response must contain exactly one complete message to succeed.
+ * @return the start result. A failed start emits no completion hook. A successful start completes
+ * through envoy_dynamic_module_on_http_filter_grpc_callout_done unless the filter is destroyed.
+ */
+envoy_dynamic_module_type_grpc_callout_init_result
+envoy_dynamic_module_callback_http_filter_grpc_callout(
+    envoy_dynamic_module_type_http_filter_envoy_ptr filter_envoy_ptr, uint64_t* callout_id_out,
+    envoy_dynamic_module_type_module_buffer cluster_name,
+    envoy_dynamic_module_type_module_buffer service, envoy_dynamic_module_type_module_buffer method,
+    envoy_dynamic_module_type_module_http_header* metadata, size_t metadata_size,
+    envoy_dynamic_module_type_module_buffer request_bytes, uint64_t timeout_milliseconds,
+    uint32_t max_message_length);
 
 /**
  * envoy_dynamic_module_callback_http_filter_start_http_stream is called by the module to start

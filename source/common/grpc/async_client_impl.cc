@@ -222,6 +222,11 @@ void AsyncStreamImpl::initialize(bool buffer_body_for_retry) {
   }
   // base64 encode on "-bin" metadata.
   base64EscapeBinHeaders(headers_message_->headers());
+  if (callbacks_.has_value()) {
+    for (const auto& [key, value] : callbacks_->onCreateBinaryInitialMetadata()) {
+      headers_message_->headers().addCopy(key, absl::Base64Escape(value));
+    }
+  }
   stream_->sendHeaders(headers_message_->headers(), false);
 }
 
@@ -317,6 +322,10 @@ void AsyncStreamImpl::onData(Buffer::Instance& data, bool end_stream) {
 // right now.
 void AsyncStreamImpl::onTrailers(Http::ResponseTrailerMapPtr&& trailers) {
   auto grpc_status = Common::getGrpcStatus(*trailers);
+  // An OK status cannot complete a response that ends partway through a message.
+  if (grpc_status == Status::WellKnownGrpcStatus::Ok && decoder_.hasBufferedData()) {
+    grpc_status = Status::WellKnownGrpcStatus::Internal;
+  }
   const std::string grpc_message = Common::getGrpcMessage(*trailers);
   if (callbacks_.has_value()) {
     callbacks_->onReceiveTrailingMetadata(std::move(trailers));

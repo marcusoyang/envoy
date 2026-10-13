@@ -16,6 +16,20 @@ use std::num::NonZero;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
+/// A completed unary gRPC callout. Every buffer borrows Envoy memory for this callback only.
+pub struct GrpcCalloutResponse<'a> {
+  /// The signed native gRPC status, including unknown codes and -1 for an invalid code.
+  pub status: i64,
+  /// The peer or native status message. It may contain sensitive data.
+  pub status_message: EnvoyBuffer<'a>,
+  /// Initial metadata, including protocol headers. Binary values remain base64 encoded.
+  pub initial_metadata: &'a [(EnvoyBuffer<'a>, EnvoyBuffer<'a>)],
+  /// `Some` includes a received empty message; `None` means no message was received.
+  pub response_message: Option<&'a [EnvoyBuffer<'a>]>,
+  /// Trailing metadata, including protocol headers. Binary values remain base64 encoded.
+  pub trailing_metadata: &'a [(EnvoyBuffer<'a>, EnvoyBuffer<'a>)],
+}
+
 /// The trait that represents the configuration for an Envoy Http filter configuration.
 /// This has one to one mapping with the [`EnvoyHttpFilterConfig`] object.
 ///
@@ -254,6 +268,17 @@ pub trait HttpFilter<EHF: EnvoyHttpFilter> {
     _result: abi::envoy_dynamic_module_type_http_callout_result,
     _response_headers: Option<&[(EnvoyBuffer, EnvoyBuffer)]>,
     _response_body: Option<&[EnvoyBuffer]>,
+  ) {
+  }
+
+  /// This is called once when a successfully started unary gRPC callout completes.
+  /// It runs on the filter's worker after `send_grpc_callout` returns. Filter destruction cancels
+  /// pending calls without invoking this callback. Borrowed response data is valid only here.
+  fn on_grpc_callout_done(
+    &self,
+    _envoy_filter: &mut EHF,
+    _callout_id: u64,
+    _response: GrpcCalloutResponse<'_>,
   ) {
   }
 
@@ -1754,6 +1779,35 @@ pub trait EnvoyHttpFilter {
     abi::envoy_dynamic_module_type_http_callout_init_result,
     u64, // callout handle
   );
+
+  /// Send one serialised protobuf message through Envoy's native gRPC client.
+  ///
+  /// The filter must already be constructed and attached to its worker. The cluster must use
+  /// HTTP/2. `timeout_milliseconds` and `max_message_length` must be positive; the message limit
+  /// applies to both the request and response. An empty request is a valid protobuf message.
+  /// Use a stable configured limit: Envoy's worker-local client cache includes it in its key.
+  ///
+  /// Metadata names must be lowercase gRPC metadata names. Protocol-owned, `grpc-` and Envoy
+  /// control header names are rejected. Values for `-bin` names are raw bytes; Envoy base64 encodes
+  /// them. Other values must use printable ASCII. Duplicate binary names are rejected.
+  /// Ordinary duplicates follow
+  /// Envoy's HTTP header handling; built-in headers may be combined. Envoy bounds outgoing metadata
+  /// before copying it and applies the cluster's response header limits to received metadata.
+  ///
+  /// Success returns a nonzero ID and delivers [`HttpFilter::on_grpc_callout_done`] after this
+  /// method returns. Failure returns zero and delivers no callback. Inputs are copied before
+  /// returning, and destroying the filter cancels pending calls. No retries are configured.
+  #[allow(clippy::too_many_arguments)] // Keep the request arguments aligned with the host ABI.
+  fn send_grpc_callout<'a>(
+    &mut self,
+    cluster_name: &'a str,
+    service: &'a str,
+    method: &'a str,
+    metadata: &'a [(&'a str, &'a [u8])],
+    request: &'a [u8],
+    timeout_milliseconds: u64,
+    max_message_length: u32,
+  ) -> (abi::envoy_dynamic_module_type_grpc_callout_init_result, u64);
 
   /// Start a streamable HTTP callout to the given cluster with the given headers and optional
   /// body. Multiple concurrent streams can be created from the same filter.
@@ -3791,6 +3845,37 @@ impl EnvoyHttpFilter for EnvoyHttpFilterImpl {
     (result, callout_id)
   }
 
+  fn send_grpc_callout<'a>(
+    &mut self,
+    cluster_name: &'a str,
+    service: &'a str,
+    method: &'a str,
+    metadata: &'a [(&'a str, &'a [u8])],
+    request: &'a [u8],
+    timeout_milliseconds: u64,
+    max_message_length: u32,
+  ) -> (abi::envoy_dynamic_module_type_grpc_callout_init_result, u64) {
+    let HeaderPairSlice(metadata_ptr, metadata_len) = metadata.into();
+    let mut callout_id = 0;
+    // SAFETY: Envoy owns this worker-local filter. All input slices remain valid and unmodified
+    // for this call; the host copies them before returning. Envoy owns and cleans up the callout.
+    let result = unsafe {
+      abi::envoy_dynamic_module_callback_http_filter_grpc_callout(
+        self.raw_ptr,
+        &mut callout_id,
+        str_to_module_buffer(cluster_name),
+        str_to_module_buffer(service),
+        str_to_module_buffer(method),
+        metadata_ptr as *mut _,
+        metadata_len,
+        bytes_to_module_buffer(request),
+        timeout_milliseconds,
+        max_message_length,
+      )
+    };
+    (result, callout_id)
+  }
+
   fn start_http_stream<'a>(
     &mut self,
     cluster_name: &'a str,
@@ -5051,6 +5136,67 @@ pub unsafe extern "C" fn envoy_dynamic_module_on_http_filter_http_callout_done(
         headers,
         body,
       )
+    },
+  );
+}
+
+/// # Safety
+///
+/// Envoy must supply a live filter handle on its creating worker. Metadata and message arrays
+/// borrow Envoy memory for this callback only. Their lengths must describe valid, readable arrays;
+/// zero-length arrays may be null. The SDK neither retains nor frees these buffers.
+#[no_mangle]
+pub unsafe extern "C" fn envoy_dynamic_module_on_http_filter_grpc_callout_done(
+  envoy_ptr: abi::envoy_dynamic_module_type_http_filter_envoy_ptr,
+  filter_ptr: abi::envoy_dynamic_module_type_http_filter_module_ptr,
+  callout_id: u64,
+  status: i64,
+  status_message: abi::envoy_dynamic_module_type_envoy_buffer,
+  initial_metadata: *const abi::envoy_dynamic_module_type_envoy_http_header,
+  initial_metadata_size: usize,
+  response_chunks: *const abi::envoy_dynamic_module_type_envoy_buffer,
+  response_chunks_size: usize,
+  has_response_message: bool,
+  trailing_metadata: *const abi::envoy_dynamic_module_type_envoy_http_header,
+  trailing_metadata_size: usize,
+) {
+  // SAFETY: The ABI provides valid worker-local handles and readable arrays for this callback.
+  // The guarded Rc keeps the filter alive during re-entry. Views below borrow those arrays only;
+  // no memory is retained, modified or freed by this adapter.
+  let _ = with_in_module_filter(
+    "envoy_dynamic_module_on_http_filter_grpc_callout_done",
+    filter_ptr,
+    |filter| {
+      let initial_metadata: Vec<_> =
+        crate::ffi_helpers::slice_from_raw_or_empty(initial_metadata, initial_metadata_size)
+          .iter()
+          .map(crate::utility::header_pair)
+          .collect();
+      let trailing_metadata: Vec<_> =
+        crate::ffi_helpers::slice_from_raw_or_empty(trailing_metadata, trailing_metadata_size)
+          .iter()
+          .map(crate::utility::header_pair)
+          .collect();
+      let response_message = has_response_message.then(|| {
+        crate::ffi_helpers::slice_from_raw_or_empty(
+          response_chunks as *const EnvoyBuffer,
+          response_chunks_size,
+        )
+      });
+      filter.on_grpc_callout_done(
+        &mut EnvoyHttpFilterImpl::new(envoy_ptr),
+        callout_id,
+        GrpcCalloutResponse {
+          status,
+          status_message: EnvoyBuffer::new_from_raw(
+            status_message.ptr as *const u8,
+            status_message.length,
+          ),
+          initial_metadata: &initial_metadata,
+          response_message,
+          trailing_metadata: &trailing_metadata,
+        },
+      );
     },
   );
 }

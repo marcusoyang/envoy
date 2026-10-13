@@ -40,6 +40,8 @@ using OnHttpFilterResponseTrailersType =
 using OnHttpFilterStreamCompleteType =
     decltype(&envoy_dynamic_module_on_http_filter_stream_complete);
 using OnHttpFilterDestroyType = decltype(&envoy_dynamic_module_on_http_filter_destroy);
+using OnHttpFilterGrpcCalloutDoneType =
+    decltype(&envoy_dynamic_module_on_http_filter_grpc_callout_done);
 using OnHttpFilterHttpCalloutDoneType =
     decltype(&envoy_dynamic_module_on_http_filter_http_callout_done);
 using OnHttpFilterHttpStreamHeadersType =
@@ -119,6 +121,8 @@ public:
   OnHttpFilterStreamCompleteType on_http_filter_stream_complete_ = nullptr;
   OnHttpFilterDestroyType on_http_filter_destroy_ = nullptr;
   OnHttpFilterHttpCalloutDoneType on_http_filter_http_callout_done_ = nullptr;
+  // Optional for modules built before unary gRPC callouts were added.
+  OnHttpFilterGrpcCalloutDoneType on_http_filter_grpc_callout_done_ = nullptr;
   OnHttpFilterHttpStreamHeadersType on_http_filter_http_stream_headers_ = nullptr;
   OnHttpFilterHttpStreamDataType on_http_filter_http_stream_data_ = nullptr;
   OnHttpFilterHttpStreamTrailersType on_http_filter_http_stream_trailers_ = nullptr;

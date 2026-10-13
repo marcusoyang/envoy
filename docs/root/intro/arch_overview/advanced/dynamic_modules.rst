@@ -55,6 +55,57 @@ There are a few design goals for the dynamic modules:
 2. **Ease of Use**: The SDK should provide a high-level API that abstracts the details of the Envoy internals.
 3. **Flexibility**: The dynamic modules should be able to implement any functionality that can be implemented by the built-in C++ extensions without performance penalty. This is work in progress and many features are not yet available.
 
+Unary gRPC callouts
+------------------
+
+HTTP filter instances can make asynchronous unary gRPC calls through Envoy's native client. The
+Rust SDK exposes ``EnvoyHttpFilter::send_grpc_callout`` and
+``HttpFilter::on_grpc_callout_done``. The module supplies a cluster, service and method name,
+application metadata, and one serialised protobuf request. Envoy handles gRPC framing and uses
+the configured cluster's HTTP/2 connection pools. The module owns protobuf serialisation and its
+application decisions. This API does not configure retries or support streaming RPCs, config-level
+calls, or Google gRPC transport.
+
+Start calls on the filter's worker after the filter has been constructed and attached. A successful
+start returns a nonzero callout ID. Its completion callback runs on the same worker after the start
+method returns, at most once. A failed start returns zero and emits no completion callback.
+Destroying the parent filter cancels pending calls and suppresses their completion callbacks.
+
+``timeout_milliseconds`` must be positive and fit a signed millisecond duration. It bounds the
+whole response, including time after response headers arrive. Envoy reports its own response
+timeout as ``DEADLINE_EXCEEDED`` and preserves peer gRPC statuses otherwise. The final status is
+a signed integer, including unknown native codes and ``-1`` for an invalid status. An OK response
+requires exactly one complete message; an absent, additional or incomplete message causes
+``INTERNAL``. ``GrpcCalloutResponse.response_message`` distinguishes a received empty message
+(``Some`` with no bytes) from no message (``None``).
+
+``max_message_length`` must be a positive byte limit. Envoy rejects an oversized request before
+copying it and applies the same limit to each response message in its native decoder, before
+buffering its payload. Keep this limit in module configuration: changing it per call changes
+Envoy's existing worker-local client-cache key. The limit is per message, rather than a limit on
+the complete HTTP response body. Received metadata uses the cluster's
+:ref:`max_response_headers_kb
+<envoy_v3_api_field_config.core.v3.HttpProtocolOptions.max_response_headers_kb>` and
+:ref:`max_headers_count <envoy_v3_api_field_config.core.v3.HttpProtocolOptions.max_headers_count>`
+limits for both headers and trailers.
+
+Application metadata names must use lowercase ASCII letters, digits, underscore, dot or hyphen.
+Protocol-owned headers, pseudoheaders, ``grpc-`` names and Envoy control headers are rejected.
+Envoy control headers use ``x-envoy-`` by default, or the configured header prefix.
+Metadata cannot override Envoy's timeout or retry policy. Ordinary values must be
+printable ASCII. Binary request values use ``-bin`` names and raw bytes; the native client base64
+encodes them. Duplicate ordinary metadata follows Envoy's HTTP header handling: custom duplicate
+names are kept, while built-in headers may be combined. Duplicate binary names are rejected.
+Outgoing metadata and RPC names must fit Envoy's default request-header size and count
+limits. Initial and trailing response metadata include protocol headers. Response binary values
+remain base64 encoded, following the native client's existing behaviour.
+
+All completion buffers borrow Envoy memory and are valid only during that callback. Copy bounded
+data if it must be retained. Status messages may contain sensitive information. The
+:repo:`ABI header <source/extensions/dynamic_modules/abi/abi.h>` documents the full ownership,
+validation and initiation-result contract. Older modules without the new completion hook continue
+loading; modules using the new callout require an Envoy host that exports it.
+
 HTTP stream timing
 ------------------
 

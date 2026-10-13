@@ -1,11 +1,15 @@
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "envoy/config/core/v3/socket_option.pb.h"
+#include "envoy/http/codec_runtime_overrides.h"
 #include "envoy/registry/registry.h"
 
 #include "source/common/http/header_map_impl.h"
+#include "source/common/http/headers.h"
 #include "source/common/http/message_impl.h"
 #include "source/common/http/utility.h"
 #include "source/common/network/socket_option_impl.h"
@@ -16,6 +20,9 @@
 #include "source/extensions/dynamic_modules/abi_context_accessors.h"
 #include "source/extensions/dynamic_modules/abi_conversions.h"
 #include "source/extensions/filters/http/dynamic_modules/filter.h"
+
+#include "absl/container/flat_hash_set.h"
+#include "absl/strings/match.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -2354,6 +2361,124 @@ void envoy_dynamic_module_callback_http_set_buffer_limit(
     return;
   }
   callbacks->setBufferLimit(limit);
+}
+
+envoy_dynamic_module_type_grpc_callout_init_result
+envoy_dynamic_module_callback_http_filter_grpc_callout(
+    envoy_dynamic_module_type_http_filter_envoy_ptr filter_envoy_ptr, uint64_t* callout_id_out,
+    envoy_dynamic_module_type_module_buffer cluster_name,
+    envoy_dynamic_module_type_module_buffer service, envoy_dynamic_module_type_module_buffer method,
+    envoy_dynamic_module_type_module_http_header* metadata, size_t metadata_size,
+    envoy_dynamic_module_type_module_buffer request_bytes, uint64_t timeout_milliseconds,
+    uint32_t max_message_length) {
+  constexpr auto InvalidArgument =
+      envoy_dynamic_module_type_grpc_callout_init_result_InvalidArgument;
+  if (callout_id_out == nullptr) {
+    return InvalidArgument;
+  }
+  *callout_id_out = 0;
+  auto valid_buffer = [](const envoy_dynamic_module_type_module_buffer& buffer) {
+    return buffer.length == 0 || buffer.ptr != nullptr;
+  };
+  if (filter_envoy_ptr == nullptr || !valid_buffer(cluster_name) || !valid_buffer(service) ||
+      !valid_buffer(method) || !valid_buffer(request_bytes) || cluster_name.length == 0 ||
+      service.length == 0 || method.length == 0 || timeout_milliseconds == 0 ||
+      timeout_milliseconds >
+          static_cast<uint64_t>(std::numeric_limits<std::chrono::milliseconds::rep>::max()) ||
+      max_message_length == 0 || request_bytes.length > max_message_length ||
+      (metadata_size > 0 && metadata == nullptr)) {
+    return InvalidArgument;
+  }
+  // Reserve space for native gRPC headers and headers added by the HTTP async client and router.
+  constexpr size_t ProtocolHeaderBytes = 256;
+  constexpr size_t ProtocolHeaderCount = 10;
+  size_t remaining_bytes = Http::DEFAULT_MAX_REQUEST_HEADERS_KB * 1024 - ProtocolHeaderBytes;
+  auto consume = [&remaining_bytes](size_t length) {
+    if (length > remaining_bytes) {
+      return false;
+    }
+    remaining_bytes -= length;
+    return true;
+  };
+  if (metadata_size > Http::DEFAULT_MAX_HEADERS_COUNT - ProtocolHeaderCount ||
+      !consume(cluster_name.length) || !consume(service.length) || !consume(method.length)) {
+    return InvalidArgument;
+  }
+  const absl::string_view cluster_view(cluster_name.ptr, cluster_name.length);
+  const absl::string_view service_view(service.ptr, service.length);
+  const absl::string_view method_view(method.ptr, method.length);
+  auto ascii_letter_or_digit = [](unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+  };
+  if (!std::all_of(
+          service_view.begin(), service_view.end(),
+          [&](unsigned char c) { return ascii_letter_or_digit(c) || c == '_' || c == '.'; }) ||
+      !std::all_of(method_view.begin(), method_view.end(),
+                   [&](unsigned char c) { return ascii_letter_or_digit(c) || c == '_'; })) {
+    return InvalidArgument;
+  }
+  absl::flat_hash_set<absl::string_view> binary_names;
+  const absl::string_view envoy_header_prefix = Http::Headers::get().prefix();
+  for (size_t index = 0; index < metadata_size; ++index) {
+    const auto& entry = metadata[index];
+    if (entry.key_ptr == nullptr || entry.key_length == 0 ||
+        (entry.value_ptr == nullptr && entry.value_length != 0) || !consume(entry.key_length)) {
+      return InvalidArgument;
+    }
+    const absl::string_view key(entry.key_ptr, entry.key_length);
+    if (!std::all_of(key.begin(), key.end(),
+                     [](unsigned char c) {
+                       return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' ||
+                              c == '.' || c == '-';
+                     }) ||
+        absl::StartsWith(key, "grpc-") || absl::StartsWithIgnoreCase(key, envoy_header_prefix) ||
+        key == "content-type" || key == "te" || key == "host" || key == "connection" ||
+        key == "content-length") {
+      return InvalidArgument;
+    }
+    if (absl::EndsWith(key, "-bin")) {
+      // Check before multiplying: binary metadata grows when the native client base64 encodes it.
+      if (entry.value_length > remaining_bytes ||
+          !consume((entry.value_length / 3) * 4 + (entry.value_length % 3 == 0 ? 0 : 4)) ||
+          !binary_names.insert(key).second) {
+        return InvalidArgument;
+      }
+    } else {
+      if (!consume(entry.value_length)) {
+        return InvalidArgument;
+      }
+      const absl::string_view value(entry.value_ptr, entry.value_length);
+      if (!std::all_of(value.begin(), value.end(),
+                       [](unsigned char c) { return c >= ' ' && c <= '~'; })) {
+        return InvalidArgument;
+      }
+    }
+  }
+
+  auto headers = Http::RequestHeaderMapImpl::create();
+  Http::LowerCaseStrPairVector binary_metadata;
+  for (size_t index = 0; index < metadata_size; ++index) {
+    const auto& entry = metadata[index];
+    const absl::string_view key(entry.key_ptr, entry.key_length);
+    if (absl::EndsWith(key, "-bin")) {
+      // HTTP header storage rejects some binary bytes. The native gRPC client encodes these first.
+      binary_metadata.emplace_back(Http::LowerCaseString(key),
+                                   entry.value_length == 0
+                                       ? std::string()
+                                       : std::string(entry.value_ptr, entry.value_length));
+    } else {
+      headers->addCopy(Http::LowerCaseString(key),
+                       absl::string_view(entry.value_ptr, entry.value_length));
+    }
+  }
+  auto request = std::make_unique<Buffer::OwnedImpl>();
+  if (request_bytes.length != 0) {
+    request->add(absl::string_view(request_bytes.ptr, request_bytes.length));
+  }
+  auto* filter = static_cast<DynamicModuleHttpFilter*>(filter_envoy_ptr);
+  return filter->sendGrpcCallout(callout_id_out, cluster_view, service_view, method_view,
+                                 std::move(headers), std::move(binary_metadata), std::move(request),
+                                 timeout_milliseconds, max_message_length);
 }
 
 envoy_dynamic_module_type_http_callout_init_result
